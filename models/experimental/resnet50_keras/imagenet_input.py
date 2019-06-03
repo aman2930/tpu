@@ -132,7 +132,9 @@ class ImageNetInput(object):
       return dataset
 
     # Read the data from disk in parallel
-    dataset = dataset.interleave(fetch_dataset, cycle_length=16)
+    dataset = dataset.interleave(
+        fetch_dataset, cycle_length=16,
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
 
     if self.is_training:
       dataset = dataset.shuffle(1024)
@@ -143,7 +145,7 @@ class ImageNetInput(object):
             self.dataset_parser,
             batch_size=self.batch_size,
             num_parallel_batches=2,
-            drop_remainder=True))
+            drop_remainder=self.is_training))
 
     # Prefetch overlaps in-feed with training
     dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)

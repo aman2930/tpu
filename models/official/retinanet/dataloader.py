@@ -30,6 +30,8 @@ from object_detection import preprocessor
 from object_detection import tf_example_decoder
 
 MAX_NUM_INSTANCES = 100
+# Represents the number of bytes in the read buffer.
+BUFFER_SIZE = None
 
 
 class InputProcessor(object):
@@ -235,9 +237,10 @@ def pad_to_fixed_size(data, pad_value, output_shape):
 class InputReader(object):
   """Input reader for dataset."""
 
-  def __init__(self, file_pattern, is_training):
+  def __init__(self, file_pattern, is_training, num_examples=0):
     self._file_pattern = file_pattern
     self._is_training = is_training
+    self._num_examples = num_examples
     self._max_num_instances = MAX_NUM_INSTANCES
 
   def __call__(self, params):
@@ -271,6 +274,9 @@ class InputReader(object):
         source_id: Source image id. Default value -1 if the source id is empty
           in the groundtruth annotation.
         image_scale: Scale of the proccessed image to the original image.
+        image_info: image information that includes the original height and
+            width, the scale of the proccessed image to the original image, and
+            the scaled height and width.
         boxes: Groundtruth bounding box annotations. The box is represented in
           [y1, x1, y2, x2] format. The tennsor is padded with -1 to the fixed
           dimension [self._max_num_instances, 4].
@@ -284,6 +290,10 @@ class InputReader(object):
       """
       with tf.name_scope('parser'):
         data = example_decoder.decode(value)
+        data['groundtruth_is_crowd'] = tf.cond(
+            tf.greater(tf.size(data['groundtruth_is_crowd']), 0),
+            lambda: data['groundtruth_is_crowd'],
+            lambda: tf.zeros_like(data['groundtruth_classes'], dtype=tf.bool))
         source_id = data['source_id']
         image = data['image']
         boxes = data['groundtruth_boxes']
@@ -292,6 +302,8 @@ class InputReader(object):
         areas = data['groundtruth_area']
         is_crowds = data['groundtruth_is_crowd']
         classes = tf.reshape(tf.cast(classes, dtype=tf.float32), [-1, 1])
+        input_height = tf.shape(image)[0]
+        input_width = tf.shape(image)[1]
 
         if params['skip_crowd_during_training'] and self._is_training:
           indices = tf.where(tf.logical_not(data['groundtruth_is_crowd']))
@@ -321,6 +333,15 @@ class InputReader(object):
 
         # Pad groundtruth data for evaluation.
         image_scale = input_processor.image_scale_to_original
+        scaled_height = tf.to_float(input_height) * input_processor.image_scale
+        scaled_width = tf.to_float(input_width) * input_processor.image_scale
+        image_info = tf.stack([
+            tf.cast(scaled_height, dtype=tf.float32),
+            tf.cast(scaled_width, dtype=tf.float32),
+            image_scale,
+            tf.cast(input_height, dtype=tf.float32),
+            tf.cast(input_width, dtype=tf.float32),
+        ])
         boxes *= image_scale
         is_crowds = tf.cast(is_crowds, dtype=tf.float32)
         boxes = pad_to_fixed_size(boxes, -1, [self._max_num_instances, 4])
@@ -331,7 +352,7 @@ class InputReader(object):
         if params['use_bfloat16']:
           image = tf.cast(image, dtype=tf.bfloat16)
         return (image, cls_targets, box_targets, num_positives, source_id,
-                image_scale, boxes, is_crowds, areas, classes)
+                image_scale, image_info, boxes, is_crowds, areas, classes)
 
     batch_size = params['batch_size']
     dataset = tf.data.Dataset.list_files(
@@ -343,12 +364,26 @@ class InputReader(object):
 
     # Prefetch data from files.
     def _prefetch_dataset(filename):
-      dataset = tf.data.TFRecordDataset(filename).prefetch(1)
+      dataset = tf.data.TFRecordDataset(
+          filename, buffer_size=BUFFER_SIZE).prefetch(1)
       return dataset
 
     dataset = dataset.apply(
         tf.contrib.data.parallel_interleave(
             _prefetch_dataset, cycle_length=32, sloppy=self._is_training))
+
+    if params.get('dataset_private_threadpool_size', None):
+      options = tf.data.Options()
+      options.experimental_threading.private_threadpool_size = params[
+          'dataset_private_threadpool_size']
+      dataset = dataset.with_options(options)
+
+    if params.get('dataset_max_intra_op_parallelism', None):
+      options = tf.data.Options()
+      options.experimental_threading.max_intra_op_parallelism = params[
+          'dataset_max_intra_op_parallelism']
+      dataset = dataset.with_options(options)
+
     if self._is_training:
       dataset = dataset.shuffle(64)
 
@@ -358,8 +393,8 @@ class InputReader(object):
     dataset = dataset.batch(batch_size, drop_remainder=True)
 
     def _process_example(images, cls_targets, box_targets, num_positives,
-                         source_ids, image_scales, boxes, is_crowds, areas,
-                         classes):
+                         source_ids, image_scales, image_info, boxes, is_crowds,
+                         areas, classes):
       """Processes one batch of data."""
       labels = {}
       # Count num_positives in a batch.
@@ -377,10 +412,15 @@ class InputReader(object):
       labels['source_ids'] = source_ids
       labels['groundtruth_data'] = groundtruth_data
       labels['image_scales'] = image_scales
+      labels['image_info'] = image_info
+      if not self._is_training:
+        return {'inputs': images, 'image_info': image_info, 'labels': labels}
       return images, labels
 
     dataset = dataset.map(_process_example)
     dataset = dataset.prefetch(tf.contrib.data.AUTOTUNE)
+    if self._num_examples > 0:
+      dataset = dataset.take(self._num_examples)
     return dataset
 
 

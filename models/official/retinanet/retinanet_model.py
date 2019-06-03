@@ -30,7 +30,9 @@ import tensorflow as tf
 
 import anchors
 import coco_metric
+import postprocess
 import retinanet_architecture
+
 
 _DEFAULT_BATCH_SIZE = 64
 _WEIGHT_DECAY = 1e-4
@@ -326,6 +328,34 @@ def coco_metric_fn(batch_size, anchor_labeler, filename=None, **kwargs):
   return coco_metrics
 
 
+def _predict_postprocess(cls_outputs, box_outputs, labels, params):
+  """Post processes prediction outputs."""
+  predict_anchors = anchors.Anchors(
+      params['min_level'], params['max_level'], params['num_scales'],
+      params['aspect_ratios'], params['anchor_scale'], params['image_size'])
+  cls_outputs, box_outputs, anchor_boxes = postprocess.reshape_outputs(
+      cls_outputs, box_outputs, predict_anchors.boxes, params['min_level'],
+      params['max_level'], params['num_classes'])
+  boxes, scores, classes, num_detections = postprocess.generate_detections(
+      cls_outputs, box_outputs, anchor_boxes)
+
+  predictions = {
+      'detection_boxes': boxes,
+      'detection_classes': classes,
+      'detection_scores': scores,
+      'num_detections': num_detections,
+  }
+
+  if labels is not None:
+    predictions.update({
+        'image_info': labels['image_info'],
+        'source_id': labels['source_ids'],
+        'groundtruth_data': labels['groundtruth_data'],
+    })
+
+  return predictions
+
+
 def _model_fn(features, labels, mode, params, model, use_tpu_estimator_spec,
               variable_filter_fn=None):
   """Model defination for the RetinaNet model based on ResNet.
@@ -335,7 +365,7 @@ def _model_fn(features, labels, mode, params, model, use_tpu_estimator_spec,
       The height and width are fixed and equal.
     labels: the input labels in a dictionary. The labels include class targets
       and box targets which are dense label maps. The labels are generated from
-      get_input_fn function in data/dataloader.py
+      get_input_fn function in dataloader.py
     mode: the mode of TPUEstimator/Estimator including TRAIN, EVAL, and PREDICT.
     params: the dictionary defines hyperparameters of model. The default
       settings are in default_hparams function in this file.
@@ -347,6 +377,16 @@ def _model_fn(features, labels, mode, params, model, use_tpu_estimator_spec,
   Returns:
     tpu_spec: the TPUEstimatorSpec to run training, evaluation, or prediction.
   """
+
+  # In predict mode features is a dict with input as value of the 'inputs'.
+  image_info = None
+  if (mode == tf.estimator.ModeKeys.PREDICT
+      and isinstance(features, dict) and 'inputs' in features):
+    image_info = features['image_info']
+    labels = None
+    if 'labels' in features:
+      labels = features['labels']
+    features = features['inputs']
 
   def _model_outputs():
     return model(
@@ -371,18 +411,22 @@ def _model_fn(features, labels, mode, params, model, use_tpu_estimator_spec,
 
   # First check if it is in PREDICT mode.
   if mode == tf.estimator.ModeKeys.PREDICT:
-    # Include all prediction values in the default graph.
-    features = tf.identity(features, 'Image')
-    predictions = {
-        'image': features,
-    }
-    for level in levels:
-      predictions['cls_outputs_%d' % level] = cls_outputs[level]
-      predictions['box_outputs_%d' % level] = box_outputs[level]
+    # Postprocess on host; memory layout for NMS on TPU is very inefficient.
+    def _predict_postprocess_wrapper(args):
+      return _predict_postprocess(*args)
 
-    # Add the computed `top-k` values in addition to the raw boxes.
-    add_metric_fn_inputs(params, cls_outputs, box_outputs, predictions)
-    return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
+    predictions = tf.contrib.tpu.outside_compilation(
+        _predict_postprocess_wrapper,
+        (cls_outputs, box_outputs, labels, params))
+
+    # Include resizing information on prediction output to help bbox drawing.
+    if image_info is not None:
+      predictions.update({
+          'image_info': tf.identity(image_info, 'ImageInfo'),
+      })
+
+    return tf.contrib.tpu.TPUEstimatorSpec(mode=tf.estimator.ModeKeys.PREDICT,
+                                           predictions=predictions)
 
   # Load pretrained model from checkpoint.
   if params['resnet_checkpoint'] and mode == tf.estimator.ModeKeys.TRAIN:
@@ -417,22 +461,25 @@ def _model_fn(features, labels, mode, params, model, use_tpu_estimator_spec,
         learning_rate, momentum=params['momentum'])
     if params['use_tpu']:
       optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
+    else:
+      if params['auto_mixed_precision']:
+        optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(
+            optimizer)
 
-    # Batch norm requires update_ops to be added as a train_op dependency.
+    # Batch norm requires `update_ops` to be executed alongside `train_op`.
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
     var_list = variable_filter_fn(
         tf.trainable_variables(),
         params['resnet_depth']) if variable_filter_fn else None
 
-    with tf.control_dependencies(update_ops):
-      train_op = optimizer.minimize(total_loss, global_step, var_list=var_list)
+    minimize_op = optimizer.minimize(total_loss, global_step, var_list=var_list)
+    train_op = tf.group(minimize_op, update_ops)
 
   else:
     train_op = None
 
   eval_metrics = None
   if mode == tf.estimator.ModeKeys.EVAL:
-
     def metric_fn(**kwargs):
       """Returns a dictionary that has the evaluation metrics."""
       batch_size = params['batch_size']
@@ -531,6 +578,10 @@ def default_hparams():
       resnet_depth=50,
       # is batchnorm training mode
       is_training_bn=True,
+      # Placeholder of number of epoches, default is 2x schedule.
+      # Reference:
+      # https://github.com/facebookresearch/Detectron/blob/master/MODEL_ZOO.md#training-schedules
+      num_epochs=24,
       # optimization
       momentum=0.9,
       learning_rate=0.08,
