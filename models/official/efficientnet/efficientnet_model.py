@@ -126,7 +126,7 @@ def round_repeats(repeats, global_params):
 
 
 class MBConvBlock(object):
-  """A class of MBConv: Mobile Inveretd Residual Bottleneck.
+  """A class of MBConv: Mobile Inverted Residual Bottleneck.
 
   Attributes:
     has_se: boolean. Whether the block contains a Squeeze and Excitation layer
@@ -405,7 +405,8 @@ class Model(tf.keras.Model):
         if drop_rate:
           drop_rate *= float(idx) / len(self._blocks)
           tf.logging.info('block_%s drop_connect_rate: %s' % (idx, drop_rate))
-        outputs = block.call(outputs, training=training)
+        outputs = block.call(
+            outputs, training=training, drop_connect_rate=drop_rate)
         self.endpoints['block_%s' % idx] = outputs
         if is_reduction:
           self.endpoints['reduction_%s' % reduction_idx] = outputs
