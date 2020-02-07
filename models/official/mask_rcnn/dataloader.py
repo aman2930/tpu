@@ -19,16 +19,18 @@ data for category classification, bounding box regression, and number of
 positive examples to normalize the loss during training.
 
 """
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 import anchors
 import coco_utils
 import preprocess_ops
+import spatial_transform_ops
 from object_detection import tf_example_decoder
 
 
 MAX_NUM_INSTANCES = 100
-MAX_NUM_POLYGON_LIST_LEN = 2600
+MAX_NUM_VERTICES_PER_INSTANCE = 1500
+MAX_NUM_POLYGON_LIST_LEN = 2 * MAX_NUM_VERTICES_PER_INSTANCE * MAX_NUM_INSTANCES
 POLYGON_PAD_VALUE = coco_utils.POLYGON_PAD_VALUE
 
 
@@ -159,11 +161,17 @@ class InputReader(object):
                              source_id)
         source_id = tf.string_to_number(source_id)
 
-        if self._mode == tf.estimator.ModeKeys.PREDICT:
+        if (self._mode == tf.estimator.ModeKeys.PREDICT or
+            self._mode == tf.estimator.ModeKeys.EVAL):
           image = preprocess_ops.normalize_image(image)
-          image, image_info, _, _ = preprocess_ops.resize_and_pad(
-              image, params['image_size'], 2 ** params['max_level'])
-          if params['use_bfloat16']:
+          if params['resize_method'] == 'retinanet':
+            image, image_info, _, _, _ = preprocess_ops.resize_crop_pad(
+                image, params['image_size'], 2 ** params['max_level'])
+          else:
+            image, image_info, _, _, _ = preprocess_ops.resize_crop_pad_v2(
+                image, params['short_side'], params['long_side'],
+                2 ** params['max_level'])
+          if params['precision'] == 'bfloat16':
             image = tf.cast(image, dtype=tf.bfloat16)
 
           features = {
@@ -175,7 +183,8 @@ class InputReader(object):
             resized_image = tf.image.resize_images(orig_image,
                                                    params['image_size'])
             features['orig_images'] = resized_image
-          if params['include_groundtruth_in_features']:
+          if (params['include_groundtruth_in_features'] or
+              self._mode == tf.estimator.ModeKeys.EVAL):
             labels = _prepare_labels_for_eval(
                 data,
                 target_num_instances=self._max_num_instances,
@@ -204,7 +213,6 @@ class InputReader(object):
               instance_masks = tf.gather_nd(instance_masks, indices)
 
           image = preprocess_ops.normalize_image(image)
-          # Random flipping.
           if params['input_rand_hflip']:
             flipped_results = (
                 preprocess_ops.random_horizontal_flip(
@@ -213,21 +221,41 @@ class InputReader(object):
               image, boxes, instance_masks = flipped_results
             else:
               image, boxes = flipped_results
-          # Scaling and padding.
-          image, image_info, boxes, instance_masks = (
-              preprocess_ops.resize_and_pad(
-                  image,
-                  params['image_size'],
-                  2 ** params['max_level'],
-                  boxes=boxes,
-                  masks=instance_masks))
+          # Scaling, jittering and padding.
+          if params['resize_method'] == 'retinanet':
+            image, image_info, boxes, classes, cropped_gt_masks = (
+                preprocess_ops.resize_crop_pad(
+                    image,
+                    params['image_size'],
+                    2 ** params['max_level'],
+                    aug_scale_min=params['aug_scale_min'],
+                    aug_scale_max=params['aug_scale_max'],
+                    boxes=boxes,
+                    classes=classes,
+                    masks=instance_masks,
+                    crop_mask_size=params['gt_mask_size']))
+          else:
+            image, image_info, boxes, classes, cropped_gt_masks = (
+                preprocess_ops.resize_crop_pad_v2(
+                    image,
+                    params['short_side'],
+                    params['long_side'],
+                    2 ** params['max_level'],
+                    aug_scale_min=params['aug_scale_min'],
+                    aug_scale_max=params['aug_scale_max'],
+                    boxes=boxes,
+                    classes=classes,
+                    masks=instance_masks,
+                    crop_mask_size=params['gt_mask_size']))
+          if cropped_gt_masks is not None:
+            cropped_gt_masks = tf.pad(
+                cropped_gt_masks,
+                paddings=tf.constant([[0, 0,], [2, 2,], [2, 2]]),
+                mode='CONSTANT',
+                constant_values=0.)
+
           padded_height, padded_width, _ = image.get_shape().as_list()
           padded_image_size = (padded_height, padded_width)
-          if self._use_instance_mask:
-            cropped_gt_masks = preprocess_ops.crop_gt_masks(
-                instance_masks, boxes, params['gt_mask_size'],
-                padded_image_size)
-
           input_anchors = anchors.Anchors(
               params['min_level'],
               params['max_level'],
@@ -248,7 +276,6 @@ class InputReader(object):
               boxes, classes)
 
           # Pad groundtruth data.
-          boxes *= image_info[2]
           boxes = preprocess_ops.pad_to_fixed_size(
               boxes, -1, [self._max_num_instances, 4])
           classes = preprocess_ops.pad_to_fixed_size(
@@ -257,7 +284,7 @@ class InputReader(object):
           # Pads cropped_gt_masks.
           if self._use_instance_mask:
             cropped_gt_masks = tf.reshape(
-                cropped_gt_masks, [self._max_num_instances, -1])
+                cropped_gt_masks, tf.stack([tf.shape(cropped_gt_masks)[0], -1]))
             cropped_gt_masks = preprocess_ops.pad_to_fixed_size(
                 cropped_gt_masks, -1,
                 [self._max_num_instances, (params['gt_mask_size'] + 4) ** 2])
@@ -266,7 +293,7 @@ class InputReader(object):
                 [self._max_num_instances, params['gt_mask_size'] + 4,
                  params['gt_mask_size'] + 4])
 
-          if params['use_bfloat16']:
+          if params['precision'] == 'bfloat16':
             image = tf.cast(image, dtype=tf.bfloat16)
 
           features = {
@@ -299,7 +326,7 @@ class InputReader(object):
       dataset = dataset.repeat()
 
     dataset = dataset.apply(
-        tf.contrib.data.parallel_interleave(
+        tf.data.experimental.parallel_interleave(
             dataset_fn,
             cycle_length=32,
             sloppy=(self._mode == tf.estimator.ModeKeys.TRAIN)))
@@ -308,27 +335,37 @@ class InputReader(object):
 
     # Parse the fetched records to input tensors for model function.
     dataset = dataset.apply(
-        tf.contrib.data.map_and_batch(
+        tf.data.experimental.map_and_batch(
             dataset_parser_fn,
             batch_size=batch_size,
             num_parallel_batches=64,
             drop_remainder=True))
 
-    # Transposes images for TPU performance.
-    # Given the batch size, the batch dimesion (N) goes to either the minor
-    # ((H, W, C, N) when N > C) or the second-minor ((H, W, N, C) when N < C)
-    # dimension. Here, we assume N is 4 or 8 and C is 3, so we use
-    # (H, W, C, N).
-    if (params['transpose_input'] and
-        self._mode == tf.estimator.ModeKeys.TRAIN):
+    # Enable TPU performance optimization: transpose input, space-to-depth
+    # image transform, or both.
+    if (self._mode == tf.estimator.ModeKeys.TRAIN and
+        (params['transpose_input'] or
+         (params['backbone'].startswith('resnet') and
+          params['conv0_space_to_depth_block_size'] > 0))):
 
-      def _transpose_images(features, labels):
-        features['images'] = tf.transpose(features['images'], [1, 2, 3, 0])
+      def _transform_images(features, labels):
+        """Transforms images."""
+        images = features['images']
+        if (params['backbone'].startswith('resnet') and
+            params['conv0_space_to_depth_block_size'] > 0):
+          # Transforms images for TPU performance.
+          features['images'] = (
+              spatial_transform_ops.fused_transpose_and_space_to_depth(
+                  images,
+                  params['conv0_space_to_depth_block_size'],
+                  params['transpose_input']))
+        else:
+          features['images'] = tf.transpose(features['images'], [1, 2, 3, 0])
         return features, labels
 
-      dataset = dataset.map(_transpose_images, num_parallel_calls=64)
+      dataset = dataset.map(_transform_images, num_parallel_calls=16)
 
-    dataset = dataset.prefetch(tf.contrib.data.AUTOTUNE)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
     if self._num_examples > 0:
       dataset = dataset.take(self._num_examples)

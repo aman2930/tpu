@@ -22,7 +22,7 @@ import collections
 import copy
 import re
 import six
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 import yaml
 
 # regex pattern that matches on key-value pairs in a comma-separated
@@ -32,9 +32,9 @@ import yaml
 _PARAM_RE = re.compile(r"""
   (?P<name>[a-zA-Z][\w\.]*)    # variable name: "var" or "x"
   \s*=\s*
-  ((?P<val>\'[^\]]*\'          # single quote
+  ((?P<val>\'(.*?)\'           # single quote
   |
-  \"[^\]]*\"                   # double quote
+  \"(.*?)\"                    # double quote
   |
   [^,\[]*                      # single value
   |
@@ -334,6 +334,11 @@ def nested_csv_str_to_json_str(csv_str):
     m_dict = m.groupdict()
     name = m_dict['name']
     v = m_dict['val']
+
+    # If a GCS path (e.g. gs://...) is provided, wrap this in quotes
+    # as yaml.load would otherwise throw an exception
+    if re.match(r'(?=[^\"\'])(?=[gs://])', v):
+      v = '\'{}\''.format(v)
 
     name_nested = name.split('.')
     if len(name_nested) > 1:

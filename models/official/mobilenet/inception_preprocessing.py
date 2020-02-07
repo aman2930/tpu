@@ -1,4 +1,4 @@
-# Copyright 2016 Google. All Rights Reserved.
+# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,17 +20,11 @@ from __future__ import print_function
 
 # Standard Imports
 from absl import flags
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
-from tensorflow.python.ops import control_flow_ops
-from tensorflow.python.ops import random_ops
+flags.DEFINE_float('cb_distortion_range', 0.1, 'Cb distortion range +/-')
 
-
-flags.DEFINE_float(
-    'cb_distortion_range', 0.1, 'Cb distortion range +/-')
-
-flags.DEFINE_float(
-    'cr_distortion_range', 0.1, 'Cr distortion range +/-')
+flags.DEFINE_float('cr_distortion_range', 0.1, 'Cr distortion range +/-')
 
 flags.DEFINE_boolean(
     'use_fast_color_distort', True,
@@ -54,9 +48,14 @@ def apply_with_random_selector(x, func, num_cases):
   """
   sel = tf.random_uniform([], maxval=num_cases, dtype=tf.int32)
   # Pass the real x only to one of the func calls.
-  return control_flow_ops.merge([
-      func(control_flow_ops.switch(x, tf.equal(sel, case))[1], case)
-      for case in range(num_cases)])[0]
+  pairs = []
+  for i in range(num_cases):
+
+    def _apply(i_value=i):
+      return func(x, i_value)
+
+    pairs.append((tf.equal(sel, i), _apply))
+  return tf.case(pairs)
 
 
 def distort_color(image, color_ordering=0, fast_mode=True, scope=None):
@@ -72,6 +71,7 @@ def distort_color(image, color_ordering=0, fast_mode=True, scope=None):
     color_ordering: Python int, a type of distortion (valid values: 0-3).
     fast_mode: Avoids slower ops (random_hue and random_contrast)
     scope: Optional scope for name_scope.
+
   Returns:
     3-D Tensor color-distorted image on range [0, 1]
   Raises:
@@ -121,15 +121,20 @@ def distort_color_fast(image, scope=None):
   Args:
     image: 3-D Tensor containing single image in [0, 1].
     scope: Optional scope for name_scope.
+
   Returns:
     3-D Tensor color-distorted image on range [0, 1]
   """
   with tf.name_scope(scope, 'distort_color', [image]):
-    br_delta = random_ops.random_uniform([], -32./255., 32./255., seed=None)
-    cb_factor = random_ops.random_uniform(
-        [], -FLAGS.cb_distortion_range, FLAGS.cb_distortion_range, seed=None)
-    cr_factor = random_ops.random_uniform(
-        [], -FLAGS.cr_distortion_range, FLAGS.cr_distortion_range, seed=None)
+    br_delta = tf.random_uniform([], -32. / 255., 32. / 255., seed=None)
+    cb_factor = tf.random_uniform([],
+                                  -FLAGS.cb_distortion_range,
+                                  FLAGS.cb_distortion_range,
+                                  seed=None)
+    cr_factor = tf.random_uniform([],
+                                  -FLAGS.cr_distortion_range,
+                                  FLAGS.cr_distortion_range,
+                                  seed=None)
 
     channels = tf.split(axis=2, num_or_size_splits=3, value=image)
     red_offset = 1.402 * cr_factor + br_delta
@@ -147,7 +152,7 @@ def distort_color_fast(image, scope=None):
 def distorted_bounding_box_crop(image,
                                 bbox,
                                 min_object_covered=0.1,
-                                aspect_ratio_range=(3./4., 4./3.),
+                                aspect_ratio_range=(3. / 4., 4. / 3.),
                                 area_range=(0.05, 1.0),
                                 max_attempts=100,
                                 scope=None):
@@ -158,20 +163,20 @@ def distorted_bounding_box_crop(image,
   Args:
     image: 3-D Tensor of image (it will be converted to floats in [0, 1]).
     bbox: 3-D float Tensor of bounding boxes arranged [1, num_boxes, coords]
-      where each coordinate is [0, 1) and the coordinates are arranged
-      as [ymin, xmin, ymax, xmax]. If num_boxes is 0 then it would use the whole
-      image.
-    min_object_covered: An optional `float`. Defaults to `0.1`. The cropped
-      area of the image must contain at least this fraction of any bounding box
+      where each coordinate is [0, 1) and the coordinates are arranged as [ymin,
+      xmin, ymax, xmax]. If num_boxes is 0 then it would use the whole image.
+    min_object_covered: An optional `float`. Defaults to `0.1`. The cropped area
+      of the image must contain at least this fraction of any bounding box
       supplied.
     aspect_ratio_range: An optional list of `floats`. The cropped area of the
       image must have an aspect ratio = width / height within this range.
-    area_range: An optional list of `floats`. The cropped area of the image
-      must contain a fraction of the supplied image within in this range.
+    area_range: An optional list of `floats`. The cropped area of the image must
+      contain a fraction of the supplied image within in this range.
     max_attempts: An optional `int`. Number of attempts at generating a cropped
       region of the image of the specified constraints. After `max_attempts`
       failures, return the entire image.
     scope: Optional scope for name_scope.
+
   Returns:
     A tuple, a 3-D Tensor cropped_image and the distorted bbox
   """
@@ -201,7 +206,10 @@ def distorted_bounding_box_crop(image,
     return cropped_image, distort_bbox
 
 
-def preprocess_for_train(image, height, width, bbox,
+def preprocess_for_train(image,
+                         height,
+                         width,
+                         bbox,
                          fast_mode=True,
                          scope=None,
                          add_image_summaries=True):
@@ -222,12 +230,13 @@ def preprocess_for_train(image, height, width, bbox,
     height: integer
     width: integer
     bbox: 3-D float Tensor of bounding boxes arranged [1, num_boxes, coords]
-      where each coordinate is [0, 1) and the coordinates are arranged
-      as [ymin, xmin, ymax, xmax].
+      where each coordinate is [0, 1) and the coordinates are arranged as [ymin,
+      xmin, ymax, xmax].
     fast_mode: Optional boolean, if True avoids slower transformations (i.e.
       bi-cubic resizing, random_hue or random_contrast).
     scope: Optional scope for name_scope.
     add_image_summaries: Enable image summaries.
+
   Returns:
     3-D float Tensor of distorted image used for training with range [-1, 1].
   """
@@ -241,8 +250,8 @@ def preprocess_for_train(image, height, width, bbox,
     if add_image_summaries:
       # Each bounding box has shape [1, num_boxes, box coords] and
       # the coordinates are ordered [ymin, xmin, ymax, xmax].
-      image_with_box = tf.image.draw_bounding_boxes(tf.expand_dims(image, 0),
-                                                    bbox)
+      image_with_box = tf.image.draw_bounding_boxes(
+          tf.expand_dims(image, 0), bbox)
       tf.summary.image('image_with_bounding_boxes', image_with_box)
 
     distorted_image, distorted_bbox = distorted_bounding_box_crop(image, bbox)
@@ -292,8 +301,11 @@ def preprocess_for_train(image, height, width, bbox,
     return distorted_image
 
 
-def preprocess_for_eval(image, height, width,
-                        central_fraction=0.875, scope=None):
+def preprocess_for_eval(image,
+                        height,
+                        width,
+                        central_fraction=0.875,
+                        scope=None):
   """Prepare one image for evaluation.
 
   If height and width are specified it would output an image with that size by
@@ -311,6 +323,7 @@ def preprocess_for_eval(image, height, width,
     width: integer
     central_fraction: Optional Float, fraction of the image to crop.
     scope: Optional scope for name_scope.
+
   Returns:
     3-D float Tensor of prepared image.
   """
@@ -325,8 +338,8 @@ def preprocess_for_eval(image, height, width,
     if height and width:
       # Resize the image to the specified height and width.
       image = tf.expand_dims(image, 0)
-      image = tf.image.resize_bilinear(image, [height, width],
-                                       align_corners=False)
+      image = tf.image.resize_bilinear(
+          image, [height, width], align_corners=False)
       image = tf.squeeze(image, [0])
     image = tf.subtract(image, 0.5)
     image = tf.multiply(image, 2.0)
@@ -334,7 +347,9 @@ def preprocess_for_eval(image, height, width,
     return image
 
 
-def preprocess_image(image, output_height, output_width,
+def preprocess_image(image,
+                     output_height,
+                     output_width,
                      is_training=False,
                      bbox=None,
                      fast_mode=True,
@@ -352,8 +367,8 @@ def preprocess_image(image, output_height, output_width,
     is_training: Boolean. If true it would transform an image for train,
       otherwise it would transform it for evaluation.
     bbox: 3-D float Tensor of bounding boxes arranged [1, num_boxes, coords]
-      where each coordinate is [0, 1) and the coordinates are arranged as
-      [ymin, xmin, ymax, xmax].
+      where each coordinate is [0, 1) and the coordinates are arranged as [ymin,
+      xmin, ymax, xmax].
     fast_mode: Optional boolean, if True avoids slower transformations.
     add_image_summaries: Enable image summaries.
 
@@ -364,8 +379,12 @@ def preprocess_image(image, output_height, output_width,
     ValueError: if user does not provide bounding box
   """
   if is_training:
-    return preprocess_for_train(image, output_height, output_width, bbox,
-                                fast_mode,
-                                add_image_summaries=add_image_summaries)
+    return preprocess_for_train(
+        image,
+        output_height,
+        output_width,
+        bbox,
+        fast_mode,
+        add_image_summaries=add_image_summaries)
   else:
     return preprocess_for_eval(image, output_height, output_width)

@@ -23,6 +23,7 @@ from __future__ import print_function
 
 from absl import flags
 import tensorflow as tf
+from tensorflow.contrib import layers as contrib_layers
 
 # Learning hyperaparmeters
 _BATCH_NORM_DECAY = 0.997
@@ -129,10 +130,10 @@ def densenet_cifar_model(image,
       global_pool,
       units=num_classes,
       activation=tf.identity,
-      kernel_initializer=tf.random_normal_initializer(stddev=2.0 / (
-          _int_shape(global_pool)[1] * 10)),
-      kernel_regularizer=tf.contrib.layers.l2_regularizer(1e-4),
-      bias_regularizer=tf.contrib.layers.l2_regularizer(1e-4),
+      kernel_initializer=tf.random_normal_initializer(
+          stddev=2.0 / (_int_shape(global_pool)[1] * 10)),
+      kernel_regularizer=contrib_layers.l2_regularizer(1e-4),
+      bias_regularizer=contrib_layers.l2_regularizer(1e-4),
   )
   return logits
 
@@ -164,7 +165,7 @@ def densenet_imagenet_model(image, k, depths, num_classes, is_training=True):
           num_channels += k
       if i != len(depths) - 1:
         num_channels /= 2
-        v = transition_layer(v, num_channels, is_training)
+        v = transition_layer(v, int(num_channels), is_training)
 
   global_pool = tf.reduce_mean(v, axis=(1, 2), name="global_pool")
   dense_layer = tf.layers.dense(global_pool, units=num_classes)

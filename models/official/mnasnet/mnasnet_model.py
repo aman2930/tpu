@@ -27,9 +27,9 @@ import collections
 import numpy as np
 import six
 from six.moves import xrange  # pylint: disable=redefined-builtin
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
-import legacy_layers
+import mnas_utils
 
 GlobalParams = collections.namedtuple('GlobalParams', [
     'batch_norm_momentum', 'batch_norm_epsilon', 'dropout_rate', 'data_format',
@@ -116,6 +116,7 @@ def _get_conv2d(filters,
                 kernel_initializer,
                 padding,
                 use_bias,
+                data_format='channels_last',
                 use_keras=True):
   """A helper function to create Conv2D layer."""
   if use_keras:
@@ -125,6 +126,7 @@ def _get_conv2d(filters,
         strides=strides,
         kernel_initializer=kernel_initializer,
         padding=padding,
+        data_format=data_format,
         use_bias=use_bias)
   else:
     return tf.layers.Conv2D(
@@ -133,6 +135,7 @@ def _get_conv2d(filters,
         strides=strides,
         kernel_initializer=kernel_initializer,
         padding=padding,
+        data_format=data_format,
         use_bias=use_bias)
 
 
@@ -156,7 +159,8 @@ class MnasBlock(object):
     self._batch_norm_momentum = global_params.batch_norm_momentum
     self._batch_norm_epsilon = global_params.batch_norm_epsilon
     self._use_keras = global_params.use_keras
-    if global_params.data_format == 'channels_first':
+    self._data_format = global_params.data_format
+    if self._data_format == 'channels_first':
       self._channel_axis = 1
       self._spatial_dims = [2, 3]
     else:
@@ -185,6 +189,7 @@ class MnasBlock(object):
           kernel_initializer=conv_kernel_initializer,
           padding='same',
           use_bias=False,
+          data_format=self._data_format,
           use_keras=self._use_keras)
       # TODO(hongkuny): b/120622234 need to manage update ops directly.
       self._bn0 = tf.layers.BatchNormalization(
@@ -201,13 +206,15 @@ class MnasBlock(object):
           strides=self._block_args.strides,
           depthwise_initializer=conv_kernel_initializer,
           padding='same',
+          data_format=self._data_format,
           use_bias=False)
     else:
-      self._depthwise_conv = legacy_layers.DepthwiseConv2D(
+      self._depthwise_conv = mnas_utils.DepthwiseConv2D(
           [kernel_size, kernel_size],
           strides=self._block_args.strides,
           depthwise_initializer=conv_kernel_initializer,
           padding='same',
+          data_format=self._data_format,
           use_bias=False)
     self._bn1 = tf.layers.BatchNormalization(
         axis=self._channel_axis,
@@ -226,6 +233,7 @@ class MnasBlock(object):
           kernel_initializer=conv_kernel_initializer,
           padding='same',
           use_bias=True,
+          data_format=self._data_format,
           use_keras=self._use_keras)
       self._se_expand = _get_conv2d(
           filters,
@@ -234,6 +242,7 @@ class MnasBlock(object):
           kernel_initializer=conv_kernel_initializer,
           padding='same',
           use_bias=True,
+          data_format=self._data_format,
           use_keras=self._use_keras)
 
     # Output phase:
@@ -245,6 +254,7 @@ class MnasBlock(object):
         kernel_initializer=conv_kernel_initializer,
         padding='same',
         use_bias=False,
+        data_format=self._data_format,
         use_keras=self._use_keras)
     self._bn2 = tf.layers.BatchNormalization(
         axis=self._channel_axis,
@@ -300,7 +310,7 @@ class MnasBlock(object):
       ) and self._block_args.input_filters == self._block_args.output_filters:
         x = tf.add(x, inputs)
     tf.logging.info('Project: %s shape: %s' % (x.name, x.shape))
-    return x
+    return tf.identity(x)
 
 
 class MnasNetModel(tf.keras.Model):
@@ -366,6 +376,7 @@ class MnasNetModel(tf.keras.Model):
         kernel_initializer=conv_kernel_initializer,
         padding='same',
         use_bias=False,
+        data_format=self._global_params.data_format,
         use_keras=self._global_params.use_keras)
     self._bn0 = tf.layers.BatchNormalization(
         axis=channel_axis,
@@ -381,6 +392,7 @@ class MnasNetModel(tf.keras.Model):
         kernel_initializer=conv_kernel_initializer,
         padding='same',
         use_bias=False,
+        data_format=self._global_params.data_format,
         use_keras=self._global_params.use_keras)
     self._bn1 = tf.layers.BatchNormalization(
         axis=channel_axis,

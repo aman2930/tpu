@@ -18,21 +18,16 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os
+import json
 
 from absl import app as absl_app
 from absl import flags
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
-# pylint: disable=g-direct-tensorflow-import
-from tensorflow.python.tpu import _tpu_estimator_embedding as embedding
-from tensorflow.python.tpu import feature_column
-# pylint: enable=g-direct-tensorflow-import
-from official.datasets import movielens
 from official.recommendation import constants as rconst
-from official.recommendation import data_pipeline
-from official.recommendation import data_preprocessing
+from official.recommendation import movielens
+from official.recommendation import ncf_input_pipeline
 from official.recommendation import neumf_model
 from official.utils.flags import core as flags_core
 from official.utils.logs import hooks_helper
@@ -40,18 +35,8 @@ from official.utils.logs import hooks_helper
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_enum(
-    name="dataset", default="ml-20m",
-    enum_values=["ml-1m", "ml-20m"], case_sensitive=False,
-    help=flags_core.help_wrap(
-        "Dataset to be trained and evaluated."))
-
-flags.DEFINE_string(
-    "data_dir", default=None,
-    help=("The directory where movielens data is stored."))
-
 flags.DEFINE_integer(
-    "batch_size", default=2048*16, help="Batch size.")
+    "batch_size", default=98304, help="Batch size.")
 
 flags.DEFINE_string(
     "model_dir", default=None,
@@ -75,7 +60,7 @@ flags.DEFINE_string(
 
 flags.DEFINE_integer(
     name="eval_batch_size",
-    default=80000,
+    default=160000,
     help=flags_core.help_wrap(
         "The batch size used for evaluation. This should generally be larger"
         "than the training batch size as the lack of back propagation during"
@@ -111,7 +96,7 @@ flags.DEFINE_integer(
         "The Number of negative instances to pair with a positive instance."))
 
 flags.DEFINE_float(
-    name="learning_rate", default=0.0005,
+    name="learning_rate", default=0.00395706,
     help=flags_core.help_wrap("The learning rate."))
 
 flags.DEFINE_bool(
@@ -130,15 +115,15 @@ flags.DEFINE_bool(
         "not stable."))
 
 flags.DEFINE_float(
-    name="beta1", default=0.9,
+    name="beta1", default=0.779661,
     help=flags_core.help_wrap("AdamOptimizer parameter hyperparam beta1."))
 
 flags.DEFINE_float(
-    name="beta2", default=0.999,
+    name="beta2", default=0.895586,
     help=flags_core.help_wrap("AdamOptimizer parameter hyperparam beta2."))
 
 flags.DEFINE_float(
-    name="epsilon", default=1e-08,
+    name="epsilon", default=1.45039e-07,
     help=flags_core.help_wrap("AdamOptimizer parameter hyperparam epsilon."))
 
 flags.DEFINE_bool(
@@ -170,7 +155,7 @@ flags.DEFINE_integer(
         "This value will be used to seed both NumPy and TensorFlow."))
 
 flags.DEFINE_integer(
-    name="train_epochs", default=2, help=flags_core.help_wrap(
+    name="train_epochs", default=14, help=flags_core.help_wrap(
         "Number of epochs to train."))
 
 flags.DEFINE_bool(
@@ -193,6 +178,21 @@ flags.DEFINE_bool(
         "For details, see "
         "tensorflow/core/protobuf/tpu/optimization_parameters.proto."))
 
+flags.DEFINE_string(
+    name="train_dataset_path",
+    default=None,
+    help=flags_core.help_wrap("Path to training data."))
+
+flags.DEFINE_string(
+    name="eval_dataset_path",
+    default=None,
+    help=flags_core.help_wrap("Path to evaluation data."))
+
+flags.DEFINE_string(
+    name="input_meta_data_path",
+    default=None,
+    help=flags_core.help_wrap("Path to input meta data file."))
+
 
 def create_tpu_estimator(model_fn, feature_columns, params):
   """Creates the TPU Estimator from the NCF model_fn."""
@@ -203,24 +203,25 @@ def create_tpu_estimator(model_fn, feature_columns, params):
       project=params["gcp_project"],
       coordinator_name="coordinator")
 
-  config = tf.contrib.tpu.RunConfig(
+  config = tf.estimator.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
       model_dir=params["model_dir"],
-      tpu_config=tf.contrib.tpu.TPUConfig(
+      tpu_config=tf.estimator.tpu.TPUConfig(
           iterations_per_loop=params["iterations_per_loop"],
-          per_host_input_for_training=tf.contrib.tpu.InputPipelineConfig
+          experimental_host_call_every_n_steps=100,
+          per_host_input_for_training=tf.estimator.tpu.InputPipelineConfig
           .PER_HOST_V2))
 
-  return tf.contrib.tpu.TPUEstimator(
+  return tf.estimator.tpu.TPUEstimator(
       use_tpu=params["use_tpu"],
       model_fn=model_fn,
       config=config,
       train_batch_size=params["global_batch_size"],
       eval_batch_size=params["eval_global_batch_size"],
       params=params,
-      embedding_config_spec=embedding.EmbeddingConfigSpec(
+      embedding_config_spec=tf.estimator.tpu.experimental.EmbeddingConfigSpec(
           feature_columns=feature_columns,
-          optimization_parameters=embedding.AdamParameters(
+          optimization_parameters=tf.tpu.experimental.AdamParameters(
               learning_rate=params["learning_rate"],
               use_gradient_accumulation=params["use_gradient_accumulation"],
               lazy_adam=params["lazy_adam"],
@@ -240,30 +241,18 @@ def create_feature_columns(params):
       key="item_id", num_buckets=params["num_items"])
 
   feature_columns = [
-      feature_column.embedding_column(
+      tf.tpu.experimental.embedding_column(
           categorical_column=user_column,
-          dimension=params["mf_dim"]+params["mlp_dim"],
+          dimension=params["mf_dim"] + params["mlp_dim"],
           combiner=None,
           initializer=initializer),
-      feature_column.embedding_column(
+      tf.tpu.experimental.embedding_column(
           categorical_column=item_column,
-          dimension=params["mf_dim"]+params["mlp_dim"],
+          dimension=params["mf_dim"] + params["mlp_dim"],
           combiner=None,
-          initializer=initializer)]
+          initializer=initializer)
+  ]
   return feature_columns
-
-
-def get_params_for_dataset(params):
-  """Creates a new params dict for the data pipeline."""
-
-  dataset_params = dict(params)
-  # Dataset needs to have a per core batch size for training and eval.
-  dataset_params["batch_size"] = (
-      params["global_batch_size"] // FLAGS.num_tpu_shards)
-  dataset_params["eval_batch_size"] = (
-      params["eval_global_batch_size"] // FLAGS.num_tpu_shards)
-
-  return dataset_params
 
 
 def main(_):
@@ -274,30 +263,43 @@ def main(_):
   if FLAGS.seed is not None:
     np.random.seed(FLAGS.seed)
 
-  if FLAGS.use_synthetic_data:
-    producer = data_pipeline.DummyConstructor()
-    num_users, num_items = data_preprocessing.DATASET_TO_NUM_USERS_AND_ITEMS[
-        FLAGS.dataset]
-    num_train_steps = rconst.SYNTHETIC_BATCHES_PER_EPOCH
-    num_eval_steps = rconst.SYNTHETIC_BATCHES_PER_EPOCH
-  else:
-    num_users, num_items, producer = data_preprocessing.instantiate_pipeline(
-        dataset=FLAGS.dataset, data_dir=FLAGS.data_dir,
-        epoch_dir=os.path.join(params["model_dir"], "epoch"),
-        params=get_params_for_dataset(params),
-        constructor_type=FLAGS.constructor_type,
-        deterministic=FLAGS.seed is not None)
+  assert params["train_dataset_path"]
+  assert params["eval_dataset_path"]
+  assert params["input_meta_data_path"]
+  with tf.io.gfile.GFile(params["input_meta_data_path"], "rb") as reader:
+    input_meta_data = json.loads(reader.read().decode("utf-8"))
+    params["num_users"] = input_meta_data["num_users"]
+    params["num_items"] = input_meta_data["num_items"]
 
-    num_train_steps = (producer.train_batches_per_epoch //
-                       params["batches_per_step"])
-    num_eval_steps = (producer.eval_batches_per_epoch //
-                      params["batches_per_step"])
-    assert not producer.train_batches_per_epoch % params["batches_per_step"]
-    assert not producer.eval_batches_per_epoch % params["batches_per_step"]
-  producer.start()
+  # In PER_HOST_V2 input mode, the number of input batches that TPUEstimator
+  # uses per step is equal to the number of TPU cores being trained on. More
+  # over when it initializes the dataset it will ask for the batch size to be
+  # the per core batchsize (i.e. global batch size / number of TPU cores).
+  num_train_steps = (int(input_meta_data["num_train_steps"]) //
+                     FLAGS.num_tpu_shards)
+  num_eval_steps = (int(input_meta_data["num_eval_steps"]) //
+                    FLAGS.num_tpu_shards)
 
-  params["num_users"] = num_users
-  params["num_items"] = num_items
+  def resize(x):
+    x["user_id"] = tf.squeeze(x["user_id"], axis=[-1])
+    x["item_id"] = tf.squeeze(x["item_id"], axis=[-1])
+    return x
+
+  def train_input_fn(params, index):
+    dataset = ncf_input_pipeline.create_dataset_from_tf_record_files(
+        params["train_dataset_path"].format(index),
+        input_meta_data["train_prebatch_size"],
+        params["batch_size"],
+        is_training=True)
+    return dataset.map(resize)
+
+  def eval_input_fn(params):
+    dataset = ncf_input_pipeline.create_dataset_from_tf_record_files(
+        params["eval_dataset_path"],
+        input_meta_data["eval_prebatch_size"],
+        params["batch_size"],
+        is_training=False)
+    return dataset.map(resize)
 
   feature_columns = create_feature_columns(params)
 
@@ -314,11 +316,10 @@ def main(_):
   for cycle_index in range(FLAGS.train_epochs):
     tf.logging.info("Starting a training cycle: {}/{}".format(
         cycle_index + 1, FLAGS.train_epochs))
-    train_input_fn = producer.make_input_fn(is_training=True)
-    estimator.train(input_fn=train_input_fn, hooks=train_hooks,
-                    steps=num_train_steps)
+    # pylint: disable=cell-var-from-loop
+    estimator.train(input_fn=lambda params: train_input_fn(params, cycle_index),
+                    hooks=train_hooks, steps=num_train_steps)
     tf.logging.info("Beginning evaluation.")
-    eval_input_fn = producer.make_input_fn(is_training=False)
     eval_results = estimator.evaluate(eval_input_fn, steps=num_eval_steps)
     tf.logging.info("Evaluation complete.")
 
@@ -328,9 +329,6 @@ def main(_):
     tf.logging.info(
         "Iteration {}: HR = {:.4f}, NDCG = {:.4f}, Loss = {:.4f}".format(
             cycle_index + 1, hr, ndcg, loss))
-
-  producer.stop_loop()
-  producer.join()
 
 
 def create_params():
@@ -343,7 +341,6 @@ def create_params():
 
   params = {
       "adam_sum_inside_sqrt": FLAGS.adam_sum_inside_sqrt,
-      "batches_per_step": FLAGS.num_tpu_shards,
       "beta1": FLAGS.beta1,
       "beta2": FLAGS.beta2,
       "epsilon": FLAGS.epsilon,
@@ -366,6 +363,9 @@ def create_params():
       "global_batch_size": FLAGS.batch_size,
       "use_gradient_accumulation": FLAGS.use_gradient_accumulation,
       "use_tpu": True,
+      "train_dataset_path": FLAGS.train_dataset_path,
+      "eval_dataset_path": FLAGS.eval_dataset_path,
+      "input_meta_data_path": FLAGS.input_meta_data_path,
   }
 
   tf.logging.info("Params: {}".format(params))
@@ -375,7 +375,7 @@ def create_params():
 
 def create_model_fn(feature_columns):
   """Creates the model_fn to be used by the TPUEstimator."""
-  def _model_fn(features, labels, mode, params):
+  def _model_fn(features, mode, params):
     """Model Function for NeuMF estimator."""
     logits = logits_fn(features, feature_columns, params)
 
@@ -391,18 +391,18 @@ def create_model_fn(feature_columns):
               params["match_mlperf"],
               use_tpu_spec=params["use_tpu"]))
 
-      return tf.contrib.tpu.TPUEstimatorSpec(
+      return tf.estimator.tpu.TPUEstimatorSpec(
           mode=mode,
           loss=cross_entropy,
           eval_metrics=(metric_fn, [in_top_k, ndcg, metric_weights]))
 
     elif mode == tf.estimator.ModeKeys.TRAIN:
-      labels = tf.cast(labels, tf.int32)
+      labels = tf.cast(features[rconst.TRAIN_LABEL_KEY], tf.int32)
       valid_pt_mask = features[rconst.VALID_POINT_MASK]
       optimizer = tf.train.AdamOptimizer(
           learning_rate=params["learning_rate"], beta1=params["beta1"],
           beta2=params["beta2"], epsilon=params["epsilon"])
-      optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
+      optimizer = tf.tpu.CrossShardOptimizer(optimizer)
 
       loss = tf.losses.sparse_softmax_cross_entropy(
           labels=labels,
@@ -422,7 +422,7 @@ def create_model_fn(feature_columns):
       update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
       train_op = tf.group(minimize_op, update_ops)
 
-      return tf.contrib.tpu.TPUEstimatorSpec(
+      return tf.estimator.tpu.TPUEstimatorSpec(
           mode=mode, loss=loss, train_op=train_op)
 
     else:
@@ -432,12 +432,7 @@ def create_model_fn(feature_columns):
 
 def logits_fn(features, feature_columns, params):
   """Calculate logits."""
-  cols_to_output_tensors = {}
-  tf.feature_column.input_layer(
-      features=features, feature_columns=feature_columns,
-      cols_to_output_tensors=cols_to_output_tensors)
-
-  input_layer = {col.name: cols_to_output_tensors[col]
+  input_layer = {col.name: tf.keras.layers.DenseFeatures(col)(features)
                  for col in feature_columns}
 
   input_layer_mf_user, input_layer_mlp_user = tf.split(
@@ -487,4 +482,5 @@ def logits_fn(features, feature_columns, params):
 
 if __name__ == "__main__":
   tf.logging.set_verbosity(tf.logging.INFO)
+  tf.disable_v2_behavior()
   absl_app.run(main)

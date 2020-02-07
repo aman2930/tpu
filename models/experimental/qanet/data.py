@@ -22,6 +22,8 @@ import string
 # Standard Imports
 import numpy as np
 import tensorflow as tf
+from tensorflow.contrib import data as contrib_data
+from tensorflow.contrib import lookup as contrib_lookup
 
 
 def build_dataset(cfg, is_tpu):
@@ -493,7 +495,7 @@ def get_input_fn(split='dev',
       shapes['context_vecs'] = [max_length if is_tpu else None, 300]
       shapes['question_vecs'] = [max_length if is_tpu else None, 300]
 
-      vocab_table = tf.contrib.lookup.index_table_from_tensor(
+      vocab_table = contrib_lookup.index_table_from_tensor(
           embedding_words, default_value=0)
       vocab_vectors = tf.constant(embedding_vectors, dtype=tf.float32)
 
@@ -514,9 +516,8 @@ def get_input_fn(split='dev',
     if shuffle and repeats != 1:
       tf.logging.info('Shuffle and repeat size: %s' % buffer_size)
       ds = ds.apply(
-          tf.contrib.data.shuffle_and_repeat(
-              buffer_size=buffer_size,
-              count=repeats))
+          contrib_data.shuffle_and_repeat(
+              buffer_size=buffer_size, count=repeats))
     elif repeats != 1:
       tf.logging.info('Repeating')
       ds = ds.repeat(count=repeats)
@@ -533,13 +534,13 @@ def get_input_fn(split='dev',
     ds = ds.map(filter_fields, num_parallel_calls=16)
 
     if is_training:
-      ds = ds.apply(
-          tf.contrib.data.padded_batch_and_drop_remainder(
-              batch_size, padded_shapes=shapes))
+      ds = ds.padded_batch(
+          batch_size, padded_shapes=shapes, drop_remainder=True)
     else:
       # Never want to ignore values at eval time
       ds = ds.padded_batch(batch_size, padded_shapes=shapes)
-    ds = ds.prefetch(tf.contrib.data.AUTOTUNE)  # Buffer a few batches ahead
+    ds = ds.prefetch(
+        tf.data.experimental.AUTOTUNE)  # Buffer a few batches ahead
     if do_embedding:
       iterator = ds.make_initializable_iterator()
       # Must be initialized when the graph is initialized and before the

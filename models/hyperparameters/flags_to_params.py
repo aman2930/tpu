@@ -14,6 +14,7 @@
 # ==============================================================================
 """Functions to override model parameters from command-line flags."""
 
+from absl import logging
 from hyperparameters import params_dict
 
 ESSENTIAL_FLAGS = ['tpu', 'data_dir', 'model_dir']
@@ -30,11 +31,6 @@ def override_params_from_input_flags(params, input_flags):
   Returns:
     ParamsDict object containing dictionary of model parameters.
   """
-  if params is None:
-    raise ValueError(
-        'Input dictionary is empty. It is expected to be loaded with default '
-        'values')
-
   if not isinstance(params, params_dict.ParamsDict):
     raise ValueError(
         'The base parameter set must be a ParamsDict, was: {}'.format(
@@ -45,8 +41,7 @@ def override_params_from_input_flags(params, input_flags):
     flag_value = input_flags.get_flag_value(key, None)
 
     if flag_value is None:
-      raise ValueError(
-          'Flag {} could not be None.'.format(key))
+      logging.warning('Flag %s is None.', key)
     else:
       essential_flag_dict[key] = flag_value
 
@@ -74,15 +69,20 @@ def get_dictionary_from_flags(params, input_flags):
   Returns:
     Python dict of overriding model parameters.
   """
+  if not isinstance(params, dict):
+    raise ValueError('The base parameter set must be a dict. '
+                     'Was: {}'.format(type(params)))
   flag_dict = {}
   for k, v in params.items():
     if isinstance(v, dict):
       d = get_dictionary_from_flags(v, input_flags)
       flag_dict[k] = d
     else:
-      flag_value = input_flags.get_flag_value(k, None)
-
-      if flag_value is not None:
-        flag_dict[k] = flag_value
+      try:
+        flag_value = input_flags.get_flag_value(k, None)
+        if flag_value is not None:
+          flag_dict[k] = flag_value
+      except AttributeError:
+        flag_dict[k] = v
 
   return flag_dict

@@ -26,8 +26,11 @@ from __future__ import print_function
 
 import math
 import re
+from absl import logging
+import numpy as np
 import six
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+import tensorflow.compat.v2 as tf2
 
 import anchors
 import fpn
@@ -40,7 +43,7 @@ import roi_ops
 import spatial_transform_ops
 import training_ops
 import sys
-sys.path.insert(0, 'tpu/models/official/mnasnet')
+sys.path.append('tpu/models/official/mnasnet')
 import mnasnet_models
 
 
@@ -59,11 +62,19 @@ def create_optimizer(learning_rate, params):
     optimizer = tf.train.RMSPropOptimizer(
         learning_rate, momentum=params['momentum'])
   elif params['optimizer'] == 'lars':
-    optimizer = tf.contrib.opt.LARSOptimizer(
-        learning_rate,
-        momentum=params['momentum'],
-        weight_decay=params['lars_weight_decay'],
-        skip_list=['batch_normalization', 'bias'])
+    try:
+      from tensorflow.contrib.opt import LARSOptimizer  # pylint: disable=g-import-not-at-top
+
+      optimizer = LARSOptimizer(
+          learning_rate,
+          momentum=params['momentum'],
+          weight_decay=params['lars_weight_decay'],
+          skip_list=['batch_normalization', 'bias'])
+    except ImportError as e:
+      logging.exception('LARSOptimizer is currently not supported '
+                        'in TensorFlow 2.x.')
+      raise e
+
   else:
     raise ValueError('Unsupported optimizer type %s.' % params['optimizer'])
   return optimizer
@@ -105,14 +116,49 @@ def remove_variables(variables, prefix):
   return var_list
 
 
+def compute_model_statistics(batch_size, is_training=True):
+  """Compute number of parameters and FLOPS."""
+  num_trainable_params = np.sum(
+      [np.prod(var.get_shape().as_list()) for var in tf.trainable_variables()])
+  logging.info('number of trainable params: %d', num_trainable_params)
+
+  options = tf.profiler.ProfileOptionBuilder.float_operation()
+  options['output'] = 'none'
+  flops = tf.profiler.profile(
+      tf.get_default_graph(), options=options).total_float_ops
+  flops_per_image = flops / batch_size
+  if is_training:
+    logging.info(
+        'number of FLOPS per image: %f in training', flops_per_image)
+  else:
+    logging.info(
+        'number of FLOPS per image: %f in eval', flops_per_image)
+
+
 def build_model_graph(features, labels, is_training, params):
   """Builds the forward model graph."""
+  use_batched_nms = (not params['use_tpu'] and params['use_batched_nms'])
+  is_gpu_inference = (not is_training and use_batched_nms)
   model_outputs = {}
 
-  if params['transpose_input'] and is_training:
-    features['images'] = tf.transpose(features['images'], [3, 0, 1, 2])
+  if is_training and params['transpose_input']:
+    if (params['backbone'].startswith('resnet') and
+        params['conv0_space_to_depth_block_size'] > 0):
+      features['images'] = tf.transpose(features['images'], [2, 0, 1, 3])
+    else:
+      features['images'] = tf.transpose(features['images'], [3, 0, 1, 2])
+
   batch_size, image_height, image_width, _ = (
       features['images'].get_shape().as_list())
+
+  conv0_space_to_depth_block_size = 0
+  if (is_training and
+      (params['backbone'].startswith('resnet') and
+       params['conv0_space_to_depth_block_size'] > 0)):
+    conv0_space_to_depth_block_size = params['conv0_space_to_depth_block_size']
+    image_height *= conv0_space_to_depth_block_size
+    image_width *= conv0_space_to_depth_block_size
+
   if 'source_ids' not in features:
     features['source_ids'] = -1 * tf.ones([batch_size], dtype=tf.float32)
 
@@ -125,6 +171,8 @@ def build_model_graph(features, labels, is_training, params):
     with tf.variable_scope(params['backbone']):
       resnet_fn = resnet.resnet_v1(
           params['backbone'],
+          conv0_kernel_size=params['conv0_kernel_size'],
+          conv0_space_to_depth_block_size=conv0_space_to_depth_block_size,
           num_batch_norm_group=params['num_batch_norm_group'])
       backbone_feats = resnet_fn(
           features['images'],
@@ -174,7 +222,7 @@ def build_model_graph(features, labels, is_training, params):
       params['rpn_nms_threshold'],
       params['rpn_min_size'],
       bbox_reg_weights=None,
-      use_batched_nms=(not params['use_tpu'] and params['use_batched_nms']))
+      use_batched_nms=use_batched_nms)
   rpn_box_rois = tf.to_float(rpn_box_rois)
   if is_training:
     rpn_box_rois = tf.stop_gradient(rpn_box_rois)
@@ -187,7 +235,6 @@ def build_model_graph(features, labels, is_training, params):
             rpn_box_rois,
             labels['gt_boxes'],
             labels['gt_classes'],
-            features['image_info'],
             batch_size_per_im=params['batch_size_per_im'],
             fg_fraction=params['fg_fraction'],
             fg_thresh=params['fg_thresh'],
@@ -196,14 +243,14 @@ def build_model_graph(features, labels, is_training, params):
 
   # Performs multi-level RoIAlign.
   box_roi_features = spatial_transform_ops.multilevel_crop_and_resize(
-      fpn_feats, rpn_box_rois, output_size=7)
+      fpn_feats, rpn_box_rois, output_size=7, is_gpu_inference=is_gpu_inference)
 
   class_outputs, box_outputs, _ = heads.box_head(
       box_roi_features, num_classes=params['num_classes'],
       mlp_head_dim=params['fast_rcnn_mlp_head_dim'])
 
   if not is_training:
-    if not params['use_tpu'] and params['use_batched_nms']:
+    if is_gpu_inference:
       generate_detections_fn = postprocess_ops.generate_detections_gpu
     else:
       generate_detections_fn = postprocess_ops.generate_detections_tpu
@@ -238,12 +285,21 @@ def build_model_graph(features, labels, is_training, params):
 
   # Faster-RCNN mode.
   if not params['include_mask']:
+    # Print #parameters and #FLOPs in model.
+    compute_model_statistics(batch_size, is_training=is_training)
+
     return model_outputs
 
   # Mask sampling
   if not is_training:
     selected_box_rois = model_outputs['detection_boxes']
-    class_indices = tf.to_int32(model_outputs['detection_classes'])
+    class_indices = model_outputs['detection_classes']
+    # If using GPU for inference, delay the cast until when Gather ops show up
+    # since GPU inference supports float point better.
+    # TODO(laigd): revisit this when newer versions of GPU libraries is
+    # released.
+    if not is_gpu_inference:
+      class_indices = tf.to_int32(class_indices)
   else:
     (selected_class_targets, selected_box_targets, selected_box_rois,
      proposal_to_label_map) = (
@@ -255,12 +311,19 @@ def build_model_graph(features, labels, is_training, params):
     class_indices = tf.to_int32(selected_class_targets)
 
   mask_roi_features = spatial_transform_ops.multilevel_crop_and_resize(
-      fpn_feats, selected_box_rois, output_size=14)
+      fpn_feats,
+      selected_box_rois,
+      output_size=14,
+      is_gpu_inference=is_gpu_inference)
   mask_outputs = heads.mask_head(
       mask_roi_features,
       class_indices,
       num_classes=params['num_classes'],
-      mrcnn_resolution=params['mrcnn_resolution'])
+      mrcnn_resolution=params['mrcnn_resolution'],
+      is_gpu_inference=is_gpu_inference)
+
+  # Print #parameters and #FLOPs in model.
+  compute_model_statistics(batch_size, is_training=is_training)
 
   if is_training:
     mask_targets = training_ops.get_mask_targets(
@@ -318,20 +381,22 @@ def _model_fn(features, labels, mode, params, variable_filter_fn=None):
   Returns:
     tpu_spec: the TPUEstimatorSpec to run training, evaluation, or prediction.
   """
-  if mode == tf.estimator.ModeKeys.PREDICT:
-    if params['include_groundtruth_in_features'] and ('labels' in features):
+  if (mode == tf.estimator.ModeKeys.PREDICT or
+      mode == tf.estimator.ModeKeys.EVAL):
+    if ((params['include_groundtruth_in_features'] or
+         mode == tf.estimator.ModeKeys.EVAL) and ('labels' in features)):
       # In include groundtruth for eval.
       labels = features['labels']
-    else:
-      labels = None
+
     if 'features' in features:
       features = features['features']
       # Otherwise, it is in export mode, the features is past in directly.
 
-  if params['use_bfloat16']:
-    with tf.contrib.tpu.bfloat16_scope():
-      model_outputs = build_model_graph(
-          features, labels, mode == tf.estimator.ModeKeys.TRAIN, params)
+  if params['precision'] == 'bfloat16':
+    with tf.tpu.bfloat16_scope():
+      model_outputs = build_model_graph(features, labels,
+                                        mode == tf.estimator.ModeKeys.TRAIN,
+                                        params)
       model_outputs.update({
           'source_id': features['source_ids'],
           'image_info': features['image_info'],
@@ -344,38 +409,55 @@ def _model_fn(features, labels, mode, params, variable_filter_fn=None):
             d[k] = tf.cast(v, tf.float32)
       cast_outputs_to_float(model_outputs)
   else:
-    model_outputs = build_model_graph(
-        features, labels, mode == tf.estimator.ModeKeys.TRAIN, params)
+    model_outputs = build_model_graph(features, labels,
+                                      mode == tf.estimator.ModeKeys.TRAIN,
+                                      params)
     model_outputs.update({
         'source_id': features['source_ids'],
         'image_info': features['image_info'],
     })
-  if mode == tf.estimator.ModeKeys.PREDICT and 'orig_images' in features:
-    model_outputs['orig_images'] = features['orig_images']
 
-  # First check if it is in PREDICT mode.
-  if mode == tf.estimator.ModeKeys.PREDICT:
-    predictions = {}
+  # First check if it is in PREDICT or EVAL mode to fill out predictions.
+  # Predictions are used during the eval step to generate metrics.
+  predictions = {}
+  if (mode == tf.estimator.ModeKeys.PREDICT or
+      mode == tf.estimator.ModeKeys.EVAL):
+    if 'orig_images' in features:
+      model_outputs['orig_images'] = features['orig_images']
     if labels and params['include_groundtruth_in_features']:
-      # Labels can only be emebeded in predictions. The predition cannot output
+      # Labels can only be embedded in predictions. The predition cannot output
       # dictionary as a value.
       predictions.update(labels)
     model_outputs.pop('fpn_features', None)
     predictions.update(model_outputs)
-
-    if params['use_tpu']:
-      return tf.contrib.tpu.TPUEstimatorSpec(mode=mode, predictions=predictions)
-    return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
+    # If we are doing PREDICT, we can return here.
+    if mode == tf.estimator.ModeKeys.PREDICT:
+      if params['use_tpu']:
+        return tf.estimator.tpu.TPUEstimatorSpec(mode=mode,
+                                                 predictions=predictions)
+      return tf.estimator.EstimatorSpec(mode=mode,
+                                        predictions=predictions)
 
   # Set up training loss and learning rate.
   global_step = tf.train.get_or_create_global_step()
-  learning_rate = learning_rates.step_learning_rate_with_linear_warmup(
-      global_step,
-      params['init_learning_rate'],
-      params['warmup_learning_rate'],
-      params['warmup_steps'],
-      params['learning_rate_levels'],
-      params['learning_rate_steps'])
+  if params['learning_rate_type'] == 'step':
+    learning_rate = learning_rates.step_learning_rate_with_linear_warmup(
+        global_step,
+        params['init_learning_rate'],
+        params['warmup_learning_rate'],
+        params['warmup_steps'],
+        params['learning_rate_levels'],
+        params['learning_rate_steps'])
+  elif params['learning_rate_type'] == 'cosine':
+    learning_rate = learning_rates.cosine_learning_rate_with_linear_warmup(
+        global_step,
+        params['init_learning_rate'],
+        params['warmup_learning_rate'],
+        params['warmup_steps'],
+        params['total_steps'])
+  else:
+    raise ValueError('Unsupported learning rate type: `{}`!'
+                     .format(params['learning_rate_type']))
   # score_loss and box_loss are for logging. only total_loss is optimized.
   total_rpn_loss, rpn_score_loss, rpn_box_loss = losses.rpn_loss(
       model_outputs['rpn_score_outputs'], model_outputs['rpn_box_outputs'],
@@ -409,14 +491,14 @@ def _model_fn(features, labels, mode, params, variable_filter_fn=None):
   if mode == tf.estimator.ModeKeys.TRAIN:
     optimizer = create_optimizer(learning_rate, params)
     if params['use_tpu']:
-      optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
+      optimizer = tf.tpu.CrossShardOptimizer(optimizer)
 
     scaffold_fn = None
     if params['warm_start_path']:
 
       def warm_start_scaffold_fn():
-        tf.logging.info(
-            'model_fn warm start from: %s",' % params['warm_start_path'])
+        logging.info(
+            'model_fn warm start from: %s,', params['warm_start_path'])
         assignment_map = _build_assigment_map(
             optimizer,
             prefix=None,
@@ -454,10 +536,10 @@ def _model_fn(features, labels, mode, params, variable_filter_fn=None):
             g.shape.num_elements() for g in old_grads if g is not None)
         clip_norm = params['global_gradient_clip_ratio'] * math.sqrt(
             num_weights)
-        tf.logging.info(
-            'Global clip norm set to %g for %d variables with %d elements.' %
-            (clip_norm, sum(1 for g in old_grads if g is not None),
-             num_weights))
+        logging.info(
+            'Global clip norm set to %g for %d variables with %d elements.',
+            clip_norm, sum(1 for g in old_grads if g is not None),
+            num_weights)
         gradients, _ = tf.clip_by_global_norm(old_grads, clip_norm)
     else:
       gradients, variables = zip(*grads_and_vars)
@@ -468,22 +550,22 @@ def _model_fn(features, labels, mode, params, variable_filter_fn=None):
       if grad is not None and ('beta' in var.name or 'bias' in var.name):
         grad = 2.0 * grad
       grads_and_vars.append((grad, var))
-    minimize_op = optimizer.apply_gradients(grads_and_vars,
-                                            global_step=global_step)
 
     with tf.control_dependencies(update_ops):
-      train_op = minimize_op
+      train_op = optimizer.apply_gradients(
+          grads_and_vars, global_step=global_step)
 
     if params['use_host_call']:
       def host_call_fn(global_step, total_loss, total_rpn_loss, rpn_score_loss,
                        rpn_box_loss, total_fast_rcnn_loss, fast_rcnn_class_loss,
-                       fast_rcnn_box_loss, mask_loss, learning_rate):
+                       fast_rcnn_box_loss, mask_loss, l2_regularization_loss,
+                       learning_rate):
         """Training host call. Creates scalar summaries for training metrics.
 
         This function is executed on the CPU and should not directly reference
         any Tensors in the rest of the `model_fn`. To pass Tensors from the
         model to the `metric_fn`, provide as part of the `host_call`. See
-        https://www.tensorflow.org/api_docs/python/tf/contrib/tpu/TPUEstimatorSpec
+        https://www.tensorflow.org/api_docs/python/tf/estimator/tpu/TPUEstimatorSpec
         for more information.
 
         Arguments should match the list of `Tensor` objects passed as the second
@@ -506,6 +588,8 @@ def _model_fn(features, labels, mode, params, variable_filter_fn=None):
             training Mask-RCNN box loss.
           mask_loss: `Tensor` with shape `[batch, ]` for the training Mask-RCNN
             mask loss.
+          l2_regularization_loss: `Tensor` with shape `[batch, ]` for the
+            regularization loss.
           learning_rate: `Tensor` with shape `[batch, ]` for the learning_rate.
 
         Returns:
@@ -517,37 +601,41 @@ def _model_fn(features, labels, mode, params, variable_filter_fn=None):
         # TPU loop is finished, setting max_queue value to the same as number of
         # iterations will make the summary writer only flush the data to storage
         # once per loop.
-        with (tf.contrib.summary.create_file_writer(
+        with (tf2.summary.create_file_writer(
             params['model_dir'],
             max_queue=params['iterations_per_loop']).as_default()):
-          with tf.contrib.summary.always_record_summaries():
-            tf.contrib.summary.scalar(
+          with tf2.summary.record_if(True):
+            tf2.summary.scalar(
                 'total_loss', tf.reduce_mean(total_loss), step=global_step)
-            tf.contrib.summary.scalar(
+            tf2.summary.scalar(
                 'total_rpn_loss', tf.reduce_mean(total_rpn_loss),
                 step=global_step)
-            tf.contrib.summary.scalar(
+            tf2.summary.scalar(
                 'rpn_score_loss', tf.reduce_mean(rpn_score_loss),
                 step=global_step)
-            tf.contrib.summary.scalar(
+            tf2.summary.scalar(
                 'rpn_box_loss', tf.reduce_mean(rpn_box_loss), step=global_step)
-            tf.contrib.summary.scalar(
+            tf2.summary.scalar(
                 'total_fast_rcnn_loss', tf.reduce_mean(total_fast_rcnn_loss),
                 step=global_step)
-            tf.contrib.summary.scalar(
+            tf2.summary.scalar(
                 'fast_rcnn_class_loss', tf.reduce_mean(fast_rcnn_class_loss),
                 step=global_step)
-            tf.contrib.summary.scalar(
+            tf2.summary.scalar(
                 'fast_rcnn_box_loss', tf.reduce_mean(fast_rcnn_box_loss),
                 step=global_step)
             if params['include_mask']:
-              tf.contrib.summary.scalar(
+              tf2.summary.scalar(
                   'mask_loss', tf.reduce_mean(mask_loss), step=global_step)
-            tf.contrib.summary.scalar(
+            tf2.summary.scalar(
+                'l2_regularization_loss',
+                tf.reduce_mean(l2_regularization_loss),
+                step=global_step)
+            tf2.summary.scalar(
                 'learning_rate', tf.reduce_mean(learning_rate),
                 step=global_step)
 
-            return tf.contrib.summary.all_summary_ops()
+            return tf.summary.all_v2_summary_ops()
 
       # To log the loss, current learning rate, and epoch for Tensorboard, the
       # summary op needs to be run on the host CPU via host_call. host_call
@@ -563,18 +651,19 @@ def _model_fn(features, labels, mode, params, variable_filter_fn=None):
       fast_rcnn_class_loss_t = tf.reshape(fast_rcnn_class_loss, [1])
       fast_rcnn_box_loss_t = tf.reshape(fast_rcnn_box_loss, [1])
       mask_loss_t = tf.reshape(mask_loss, [1])
+      l2_regularization_loss = tf.reshape(l2_regularization_loss, [1])
       learning_rate_t = tf.reshape(learning_rate, [1])
       host_call = (host_call_fn,
                    [global_step_t, total_loss_t, total_rpn_loss_t,
                     rpn_score_loss_t, rpn_box_loss_t, total_fast_rcnn_loss_t,
                     fast_rcnn_class_loss_t, fast_rcnn_box_loss_t,
-                    mask_loss_t, learning_rate_t])
+                    mask_loss_t, l2_regularization_loss, learning_rate_t])
   else:
     train_op = None
     scaffold_fn = None
 
   if params['use_tpu']:
-    return tf.contrib.tpu.TPUEstimatorSpec(
+    return tf.estimator.tpu.TPUEstimatorSpec(
         mode=mode,
         loss=total_loss,
         train_op=train_op,

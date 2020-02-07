@@ -35,6 +35,8 @@ import tensorflow as tf
 import imagenet_input
 import model_saving_utils
 import resnet_model
+from tensorflow.contrib import cluster_resolver as contrib_cluster_resolver
+from tensorflow.contrib import distribute as contrib_distribute
 
 # Common flags for TPU models.
 flags.DEFINE_string('tpu', None, 'Name of the TPU to use.')
@@ -158,9 +160,7 @@ def sparse_top_k_categorical_accuracy(y_true, y_pred, k=5):
     y_true = tf.squeeze(y_true, [-1])
 
   y_true = tf.cast(y_true, 'int32')
-
-  in_top_k_on_device = tf.nn.in_top_k(y_pred, y_true, k)
-  return tf.keras.backend.mean(in_top_k_on_device, axis=-1)
+  return tf.nn.in_top_k(y_pred, y_true, k)
 
 
 def main(unused_argv):
@@ -177,9 +177,9 @@ def main(unused_argv):
   logging.info('Saving tensorboard summaries at %s', model_dir)
 
   logging.info('Use TPU at %s', FLAGS.tpu if FLAGS.tpu is not None else 'local')
-  resolver = tf.contrib.cluster_resolver.TPUClusterResolver(tpu=FLAGS.tpu)
-  tf.contrib.distribute.initialize_tpu_system(resolver)
-  strategy = tf.contrib.distribute.TPUStrategy(resolver)
+  resolver = contrib_cluster_resolver.TPUClusterResolver(tpu=FLAGS.tpu)
+  contrib_distribute.initialize_tpu_system(resolver)
+  strategy = contrib_distribute.TPUStrategy(resolver)
 
   logging.info('Use bfloat16: %s.', USE_BFLOAT16)
   logging.info('Use global batch size: %s.', batch_size)

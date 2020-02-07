@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Train a EfficientNet on ImageNet on TPU."""
+"""Train a EfficientNets on ImageNet on TPU."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -22,17 +22,19 @@ import os
 import time
 from absl import app
 from absl import flags
+from absl import logging
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+import tensorflow.compat.v2 as tf2  # used for summaries only.
 
 import efficientnet_builder
 import imagenet_input
 import utils
-from tensorflow.contrib.tpu.python.tpu import async_checkpoint
-from tensorflow.contrib.training.python.training import evaluation
+from condconv import efficientnet_condconv_builder
+from edgetpu import efficientnet_edgetpu_builder
+from tpu import efficientnet_tpu_builder
 from tensorflow.core.protobuf import rewriter_config_pb2
 from tensorflow.python.estimator import estimator
-
 
 FLAGS = flags.FLAGS
 
@@ -79,6 +81,26 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     'mode', default='train_and_eval',
     help='One of {"train_and_eval", "train", "eval"}.')
+
+flags.DEFINE_string(
+    'augment_name', default=None,
+    help='`string` that is the name of the augmentation method'
+         'to apply to the image. `autoaugment` if AutoAugment is to be used or'
+         '`randaugment` if RandAugment is to be used. If the value is `None` no'
+         'augmentation method will be applied applied. See autoaugment.py for  '
+         'more details.')
+
+
+flags.DEFINE_integer(
+    'randaug_num_layers', default=2,
+    help='If RandAug is used, what should the number of layers be.'
+         'See autoaugment.py for detailed description.')
+
+flags.DEFINE_integer(
+    'randaug_magnitude', default=10,
+    help='If RandAug is used, what should the magnitude be. '
+         'See autoaugment.py for detailed description.')
+
 
 flags.DEFINE_integer(
     'train_steps', default=218949,
@@ -164,6 +186,7 @@ flags.DEFINE_string(
           ' will improve performance.'))
 flags.DEFINE_integer(
     'num_label_classes', default=1000, help='Number of classes, at least 2')
+
 flags.DEFINE_float(
     'batch_norm_momentum',
     default=None,
@@ -217,15 +240,19 @@ flags.DEFINE_float(
     help=('Dropout rate for the final output layer.'))
 
 flags.DEFINE_float(
-    'drop_connect_rate', default=None,
+    'survival_prob', default=None,
     help=('Drop connect rate for the network.'))
 
+flags.DEFINE_float(
+    'mixup_alpha',
+    default=0.0,
+    help=('Alpha parameter for mixup regularization, 0.0 to disable.'))
 
 flags.DEFINE_integer('log_step_count_steps', 64, 'The number of steps at '
                      'which the global step information is logged.')
 
 flags.DEFINE_bool(
-    'use_cache', default=True, help=('Enable cache for training input.'))
+    'use_cache', default=False, help=('Enable cache for training input.'))
 
 flags.DEFINE_float(
     'depth_coefficient', default=None,
@@ -233,15 +260,10 @@ flags.DEFINE_float(
 
 flags.DEFINE_float(
     'width_coefficient', default=None,
-    help=('WIdth coefficient for scaling channel size.'))
+    help=('Width coefficient for scaling channel size.'))
 
 flags.DEFINE_bool(
     'use_async_checkpointing', default=False, help=('Enable async checkpoint'))
-
-# The input tensor is in the range of [0, 255], we need to scale them to the
-# range of [0, 1]
-MEAN_RGB = [0.485 * 255, 0.456 * 255, 0.406 * 255]
-STDDEV_RGB = [0.229 * 255, 0.224 * 255, 0.225 * 255]
 
 
 def model_fn(features, labels, mode, params):
@@ -249,7 +271,7 @@ def model_fn(features, labels, mode, params):
 
   Args:
     features: `Tensor` of batched images.
-    labels: `Tensor` of labels for the data samples
+    labels: `Tensor` of one hot labels for the data samples
     mode: one of `tf.estimator.ModeKeys.{TRAIN,EVAL,PREDICT}`
     params: `dict` of parameters passed to the model from the TPUEstimator,
         `params['batch_size']` is always provided and should be used as the
@@ -262,25 +284,24 @@ def model_fn(features, labels, mode, params):
     features = features['feature']
 
   # In most cases, the default data format NCHW instead of NHWC should be
-  # used for a significant performance boost on GPU/TPU. NHWC should be used
+  # used for a significant performance boost on GPU. NHWC should be used
   # only if the network needs to be run on CPU since the pooling operations
-  # are only supported on NHWC.
+  # are only supported on NHWC. TPU uses XLA compiler to figure out best layout.
   if FLAGS.data_format == 'channels_first':
     assert not FLAGS.transpose_input    # channels_first only for GPU
     features = tf.transpose(features, [0, 3, 1, 2])
+    stats_shape = [3, 1, 1]
+  else:
+    stats_shape = [1, 1, 3]
 
   if FLAGS.transpose_input and mode != tf.estimator.ModeKeys.PREDICT:
     features = tf.transpose(features, [3, 0, 1, 2])  # HWCN to NHWC
-
-  # Normalize the image to zero mean and unit variance.
-  features -= tf.constant(MEAN_RGB, shape=[1, 1, 3], dtype=features.dtype)
-  features /= tf.constant(STDDEV_RGB, shape=[1, 1, 3], dtype=features.dtype)
 
   is_training = (mode == tf.estimator.ModeKeys.TRAIN)
   has_moving_average_decay = (FLAGS.moving_average_decay > 0)
   # This is essential, if using a keras-derived model.
   tf.keras.backend.set_learning_phase(is_training)
-  tf.logging.info('Using open-source implementation.')
+  logging.info('Using open-source implementation.')
   override_params = {}
   if FLAGS.batch_norm_momentum is not None:
     override_params['batch_norm_momentum'] = FLAGS.batch_norm_momentum
@@ -288,8 +309,8 @@ def model_fn(features, labels, mode, params):
     override_params['batch_norm_epsilon'] = FLAGS.batch_norm_epsilon
   if FLAGS.dropout_rate is not None:
     override_params['dropout_rate'] = FLAGS.dropout_rate
-  if FLAGS.drop_connect_rate is not None:
-    override_params['drop_connect_rate'] = FLAGS.drop_connect_rate
+  if FLAGS.survival_prob is not None:
+    override_params['survival_prob'] = FLAGS.survival_prob
   if FLAGS.data_format:
     override_params['data_format'] = FLAGS.data_format
   if FLAGS.num_label_classes:
@@ -298,12 +319,32 @@ def model_fn(features, labels, mode, params):
     override_params['depth_coefficient'] = FLAGS.depth_coefficient
   if FLAGS.width_coefficient:
     override_params['width_coefficient'] = FLAGS.width_coefficient
-  if FLAGS.num_label_classes:
-    override_params['num_classes'] = FLAGS.num_label_classes
+
+  def normalize_features(features, mean_rgb, stddev_rgb):
+    """Normalize the image given the means and stddevs."""
+    features -= tf.constant(mean_rgb, shape=stats_shape, dtype=features.dtype)
+    features /= tf.constant(stddev_rgb, shape=stats_shape, dtype=features.dtype)
+    return features
 
   def build_model():
-    logits, _ = efficientnet_builder.build_model(
-        features,
+    """Build model using the model_name given through the command line."""
+    model_builder = None
+    if FLAGS.model_name.startswith('efficientnet-edgetpu'):
+      model_builder = efficientnet_edgetpu_builder
+    elif FLAGS.model_name.startswith('efficientnet-tpu'):
+      model_builder = efficientnet_tpu_builder
+    elif FLAGS.model_name.startswith('efficientnet-condconv'):
+      model_builder = efficientnet_condconv_builder
+    elif FLAGS.model_name.startswith('efficientnet'):
+      model_builder = efficientnet_builder
+    else:
+      raise ValueError('Model must be efficientnet-b*, efficientnet-edgetpu* '
+                       'efficientnet-tpu*, or efficientnet-condconv*')
+
+    normalized_features = normalize_features(features, model_builder.MEAN_RGB,
+                                             model_builder.STDDEV_RGB)
+    logits, _ = model_builder.build_model(
+        normalized_features,
         model_name=FLAGS.model_name,
         training=is_training,
         override_params=override_params,
@@ -311,7 +352,7 @@ def model_fn(features, labels, mode, params):
     return logits
 
   if params['use_bfloat16']:
-    with tf.contrib.tpu.bfloat16_scope():
+    with tf.tpu.bfloat16_scope():
       logits = tf.cast(build_model(), tf.float32)
   else:
     logits = build_model()
@@ -333,10 +374,9 @@ def model_fn(features, labels, mode, params):
   batch_size = params['batch_size']   # pylint: disable=unused-variable
 
   # Calculate loss, which includes softmax cross entropy and L2 regularization.
-  one_hot_labels = tf.one_hot(labels, FLAGS.num_label_classes)
   cross_entropy = tf.losses.softmax_cross_entropy(
       logits=logits,
-      onehot_labels=one_hot_labels,
+      onehot_labels=labels,
       label_smoothing=FLAGS.label_smoothing)
 
   # Add weight decay to the loss for non-batch-normalization variables.
@@ -348,12 +388,7 @@ def model_fn(features, labels, mode, params):
   if has_moving_average_decay:
     ema = tf.train.ExponentialMovingAverage(
         decay=FLAGS.moving_average_decay, num_updates=global_step)
-    ema_vars = tf.trainable_variables() + tf.get_collection('moving_vars')
-    for v in tf.global_variables():
-      # We maintain mva for batch norm moving mean and variance as well.
-      if 'moving_mean' in v.name or 'moving_variance' in v.name:
-        ema_vars.append(v)
-    ema_vars = list(set(ema_vars))
+    ema_vars = utils.get_ema_vars()
 
   host_call = None
   restore_vars_dict = None
@@ -363,6 +398,7 @@ def model_fn(features, labels, mode, params):
         tf.cast(global_step, tf.float32) / params['steps_per_epoch'])
 
     scaled_lr = FLAGS.base_learning_rate * (FLAGS.train_batch_size / 256.0)
+    logging.info('base_learning_rate = %f', FLAGS.base_learning_rate)
     learning_rate = utils.build_learning_rate(scaled_lr, global_step,
                                               params['steps_per_epoch'])
     optimizer = utils.build_optimizer(learning_rate)
@@ -370,7 +406,7 @@ def model_fn(features, labels, mode, params):
       # When using TPU, wrap the optimizer with CrossShardOptimizer which
       # handles synchronization details between different TPU cores. To the
       # user, this should look like regular synchronous training.
-      optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
+      optimizer = tf.tpu.CrossShardOptimizer(optimizer)
 
     # Batch normalization requires UPDATE_OPS to be added as a dependency to
     # the train operation.
@@ -389,7 +425,7 @@ def model_fn(features, labels, mode, params):
         This function is executed on the CPU and should not directly reference
         any Tensors in the rest of the `model_fn`. To pass Tensors from the
         model to the `metric_fn`, provide as part of the `host_call`. See
-        https://www.tensorflow.org/api_docs/python/tf/contrib/tpu/TPUEstimatorSpec
+        https://www.tensorflow.org/api_docs/python/tf/estimator/tpu/TPUEstimatorSpec
         for more information.
 
         Arguments should match the list of `Tensor` objects passed as the second
@@ -408,13 +444,13 @@ def model_fn(features, labels, mode, params):
         # TPU loop is finished, setting max_queue value to the same as number of
         # iterations will make the summary writer only flush the data to storage
         # once per loop.
-        with tf.contrib.summary.create_file_writer(
+        with tf2.summary.create_file_writer(
             FLAGS.model_dir, max_queue=FLAGS.iterations_per_loop).as_default():
-          with tf.contrib.summary.always_record_summaries():
-            tf.contrib.summary.scalar('learning_rate', lr[0], step=gs)
-            tf.contrib.summary.scalar('current_epoch', ce[0], step=gs)
+          with tf2.summary.record_if(True):
+            tf2.summary.scalar('learning_rate', lr[0], step=gs)
+            tf2.summary.scalar('current_epoch', ce[0], step=gs)
 
-            return tf.contrib.summary.all_summary_ops()
+            return tf.summary.all_v2_summary_ops()
 
       # To log the loss, current learning rate, and epoch for Tensorboard, the
       # summary op needs to be run on the host CPU via host_call. host_call
@@ -441,19 +477,20 @@ def model_fn(features, labels, mode, params):
       This function is executed on the CPU and should not directly reference
       any Tensors in the rest of the `model_fn`. To pass Tensors from the model
       to the `metric_fn`, provide as part of the `eval_metrics`. See
-      https://www.tensorflow.org/api_docs/python/tf/contrib/tpu/TPUEstimatorSpec
+      https://www.tensorflow.org/api_docs/python/tf/estimator/tpu/TPUEstimatorSpec
       for more information.
 
       Arguments should match the list of `Tensor` objects passed as the second
       element in the tuple passed to `eval_metrics`.
 
       Args:
-        labels: `Tensor` with shape `[batch]`.
+        labels: `Tensor` with shape `[batch, num_classes]`.
         logits: `Tensor` with shape `[batch, num_classes]`.
 
       Returns:
         A dict of the metrics to return from evaluation.
       """
+      labels = tf.argmax(labels, axis=1)
       predictions = tf.argmax(logits, axis=1)
       top_1_accuracy = tf.metrics.accuracy(labels, predictions)
       in_top_5 = tf.cast(tf.nn.in_top_k(logits, labels, 5), tf.float32)
@@ -467,19 +504,25 @@ def model_fn(features, labels, mode, params):
     eval_metrics = (metric_fn, [labels, logits])
 
   num_params = np.sum([np.prod(v.shape) for v in tf.trainable_variables()])
-  tf.logging.info('number of trainable parameters: {}'.format(num_params))
+  logging.info('number of trainable parameters: %d', num_params)
 
   def _scaffold_fn():
     saver = tf.train.Saver(restore_vars_dict)
     return tf.train.Scaffold(saver=saver)
 
-  return tf.contrib.tpu.TPUEstimatorSpec(
+  if has_moving_average_decay and not is_training:
+    # Only apply scaffold for eval jobs.
+    scaffold_fn = _scaffold_fn
+  else:
+    scaffold_fn = None
+
+  return tf.estimator.tpu.TPUEstimatorSpec(
       mode=mode,
       loss=loss,
       train_op=train_op,
       host_call=host_call,
       eval_metrics=eval_metrics,
-      scaffold_fn=_scaffold_fn if has_moving_average_decay else None)
+      scaffold_fn=scaffold_fn)
 
 
 def _verify_non_empty_string(value, field_name):
@@ -551,10 +594,12 @@ def export(est, export_dir, input_image_size=None):
 
   if not input_image_size:
     input_image_size = FLAGS.input_image_size
+  is_cond_conv = FLAGS.model_name.startswith('efficientnet-condconv')
+  batch_size = 1 if is_cond_conv else None  # Use fixed batch size for condconv.
 
-  tf.logging.info('Starting to export model.')
+  logging.info('Starting to export model.')
   image_serving_input_fn = imagenet_input.build_image_serving_input_fn(
-      input_image_size)
+      input_image_size, batch_size=batch_size)
   est.export_saved_model(
       export_dir_base=export_dir,
       serving_input_receiver_fn=image_serving_input_fn)
@@ -564,22 +609,38 @@ def main(unused_argv):
 
   input_image_size = FLAGS.input_image_size
   if not input_image_size:
-    if FLAGS.model_name.startswith('efficientnet'):
+    if FLAGS.model_name.startswith('efficientnet-edgetpu'):
+      _, _, input_image_size, _ = efficientnet_edgetpu_builder.efficientnet_edgetpu_params(
+          FLAGS.model_name)
+    elif FLAGS.model_name.startswith('efficientnet-tpu'):
+      _, _, input_image_size, _ = efficientnet_tpu_builder.efficientnet_tpu_params(
+          FLAGS.model_name)
+    elif FLAGS.model_name.startswith('efficientnet-condconv'):
+      _, _, input_image_size, _, _ = efficientnet_condconv_builder.efficientnet_condconv_params(
+          FLAGS.model_name)
+    elif FLAGS.model_name.startswith('efficientnet'):
       _, _, input_image_size, _ = efficientnet_builder.efficientnet_params(
           FLAGS.model_name)
     else:
-      raise ValueError('input_image_size must be set expect for EfficientNet.')
+      raise ValueError('input_image_size must be set except for EfficientNet')
 
-  tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-      FLAGS.tpu if (FLAGS.tpu or FLAGS.use_tpu) else '',
-      zone=FLAGS.tpu_zone,
-      project=FLAGS.gcp_project)
+  # For imagenet dataset, include background label if number of output classes
+  # is 1001
+  include_background_label = (FLAGS.num_label_classes == 1001)
+
+  if FLAGS.tpu or FLAGS.use_tpu:
+    tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
+        FLAGS.tpu,
+        zone=FLAGS.tpu_zone,
+        project=FLAGS.gcp_project)
+  else:
+    tpu_cluster_resolver = None
 
   if FLAGS.use_async_checkpointing:
     save_checkpoints_steps = None
   else:
     save_checkpoints_steps = max(100, FLAGS.iterations_per_loop)
-  config = tf.contrib.tpu.RunConfig(
+  config = tf.estimator.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
       model_dir=FLAGS.model_dir,
       save_checkpoints_steps=save_checkpoints_steps,
@@ -588,15 +649,15 @@ def main(unused_argv):
           graph_options=tf.GraphOptions(
               rewrite_options=rewriter_config_pb2.RewriterConfig(
                   disable_meta_optimizer=True))),
-      tpu_config=tf.contrib.tpu.TPUConfig(
+      tpu_config=tf.estimator.tpu.TPUConfig(
           iterations_per_loop=FLAGS.iterations_per_loop,
-          per_host_input_for_training=tf.contrib.tpu.InputPipelineConfig
+          per_host_input_for_training=tf.estimator.tpu.InputPipelineConfig
           .PER_HOST_V2))  # pylint: disable=line-too-long
   # Initializes model parameters.
   params = dict(
       steps_per_epoch=FLAGS.num_train_images / FLAGS.train_batch_size,
       use_bfloat16=FLAGS.use_bfloat16)
-  est = tf.contrib.tpu.TPUEstimator(
+  est = tf.estimator.tpu.TPUEstimator(
       use_tpu=FLAGS.use_tpu,
       model_fn=model_fn,
       config=config,
@@ -607,38 +668,52 @@ def main(unused_argv):
 
   # Input pipelines are slightly different (with regards to shuffling and
   # preprocessing) between training and evaluation.
-  if FLAGS.bigtable_instance:
-    tf.logging.info('Using Bigtable dataset, table %s', FLAGS.bigtable_table)
-    select_train, select_eval = _select_tables_from_flags()
-    imagenet_train, imagenet_eval = [imagenet_input.ImageNetBigtableInput(
-        is_training=is_training,
-        use_bfloat16=FLAGS.use_bfloat16,
-        transpose_input=FLAGS.transpose_input,
-        selection=selection) for (is_training, selection) in
-                                     [(True, select_train),
-                                      (False, select_eval)]]
-  else:
-    if FLAGS.data_dir == FAKE_DATA_DIR:
-      tf.logging.info('Using fake dataset.')
+  def build_imagenet_input(is_training):
+    """Generate ImageNetInput for training and eval."""
+    if FLAGS.bigtable_instance:
+      logging.info('Using Bigtable dataset, table %s', FLAGS.bigtable_table)
+      select_train, select_eval = _select_tables_from_flags()
+      return imagenet_input.ImageNetBigtableInput(
+          is_training=is_training,
+          use_bfloat16=FLAGS.use_bfloat16,
+          transpose_input=FLAGS.transpose_input,
+          selection=select_train if is_training else select_eval,
+          num_label_classes=FLAGS.num_label_classes,
+          include_background_label=include_background_label,
+          augment_name=FLAGS.augment_name,
+          mixup_alpha=FLAGS.mixup_alpha,
+          randaug_num_layers=FLAGS.randaug_num_layers,
+          randaug_magnitude=FLAGS.randaug_magnitude)
     else:
-      tf.logging.info('Using dataset: %s', FLAGS.data_dir)
-    imagenet_train, imagenet_eval = [
-        imagenet_input.ImageNetInput(
-            is_training=is_training,
-            data_dir=FLAGS.data_dir,
-            transpose_input=FLAGS.transpose_input,
-            cache=FLAGS.use_cache and is_training,
-            image_size=input_image_size,
-            num_parallel_calls=FLAGS.num_parallel_calls,
-            use_bfloat16=FLAGS.use_bfloat16) for is_training in [True, False]
-    ]
+      if FLAGS.data_dir == FAKE_DATA_DIR:
+        logging.info('Using fake dataset.')
+      else:
+        logging.info('Using dataset: %s', FLAGS.data_dir)
+
+      return imagenet_input.ImageNetInput(
+          is_training=is_training,
+          data_dir=FLAGS.data_dir,
+          transpose_input=FLAGS.transpose_input,
+          cache=FLAGS.use_cache and is_training,
+          image_size=input_image_size,
+          num_parallel_calls=FLAGS.num_parallel_calls,
+          use_bfloat16=FLAGS.use_bfloat16,
+          num_label_classes=FLAGS.num_label_classes,
+          include_background_label=include_background_label,
+          augment_name=FLAGS.augment_name,
+          mixup_alpha=FLAGS.mixup_alpha,
+          randaug_num_layers=FLAGS.randaug_num_layers,
+          randaug_magnitude=FLAGS.randaug_magnitude)
+
+  imagenet_train = build_imagenet_input(is_training=True)
+  imagenet_eval = build_imagenet_input(is_training=False)
 
   if FLAGS.mode == 'eval':
     eval_steps = FLAGS.num_eval_images // FLAGS.eval_batch_size
     # Run evaluation when there's a new checkpoint
-    for ckpt in evaluation.checkpoints_iterator(
+    for ckpt in tf.train.checkpoints_iterator(
         FLAGS.model_dir, timeout=FLAGS.eval_timeout):
-      tf.logging.info('Starting to evaluate.')
+      logging.info('Starting to evaluate.')
       try:
         start_timestamp = time.time()  # This time will include compilation time
         eval_results = est.evaluate(
@@ -646,14 +721,14 @@ def main(unused_argv):
             steps=eval_steps,
             checkpoint_path=ckpt)
         elapsed_time = int(time.time() - start_timestamp)
-        tf.logging.info('Eval results: %s. Elapsed seconds: %d',
-                        eval_results, elapsed_time)
+        logging.info('Eval results: %s. Elapsed seconds: %d',
+                     eval_results, elapsed_time)
         utils.archive_ckpt(eval_results, eval_results['top_1_accuracy'], ckpt)
 
         # Terminate eval job when final checkpoint is reached
         current_step = int(os.path.basename(ckpt).split('-')[1])
         if current_step >= FLAGS.train_steps:
-          tf.logging.info(
+          logging.info(
               'Evaluation finished after training step %d', current_step)
           break
 
@@ -662,15 +737,12 @@ def main(unused_argv):
         # sometimes the TPU worker does not finish initializing until long after
         # the CPU job tells it to start evaluating. In this case, the checkpoint
         # file could have been deleted already.
-        tf.logging.info(
+        logging.info(
             'Checkpoint %s no longer exists, skipping checkpoint', ckpt)
-
-    if FLAGS.export_dir:
-      export(est, FLAGS.export_dir, input_image_size)
   else:   # FLAGS.mode == 'train' or FLAGS.mode == 'train_and_eval'
     current_step = estimator._load_global_step_from_checkpoint_dir(FLAGS.model_dir)  # pylint: disable=protected-access,line-too-long
 
-    tf.logging.info(
+    logging.info(
         'Training for %d steps (%.2f epochs in total). Current'
         ' step %d.', FLAGS.train_steps,
         FLAGS.train_steps / params['steps_per_epoch'], current_step)
@@ -680,6 +752,13 @@ def main(unused_argv):
     if FLAGS.mode == 'train':
       hooks = []
       if FLAGS.use_async_checkpointing:
+        try:
+          from tensorflow.contrib.tpu.python.tpu import async_checkpoint  # pylint: disable=g-import-not-at-top
+        except ImportError as e:
+          logging.exception(
+              'Async checkpointing is not supported in TensorFlow 2.x')
+          raise e
+
         hooks.append(
             async_checkpoint.AsyncCheckpointSaverHook(
                 checkpoint_dir=FLAGS.model_dir,
@@ -699,29 +778,29 @@ def main(unused_argv):
         est.train(input_fn=imagenet_train.input_fn, max_steps=next_checkpoint)
         current_step = next_checkpoint
 
-        tf.logging.info('Finished training up to step %d. Elapsed seconds %d.',
-                        next_checkpoint, int(time.time() - start_timestamp))
+        logging.info('Finished training up to step %d. Elapsed seconds %d.',
+                     next_checkpoint, int(time.time() - start_timestamp))
 
         # Evaluate the model on the most recent model in --model_dir.
         # Since evaluation happens in batches of --eval_batch_size, some images
         # may be excluded modulo the batch size. As long as the batch size is
         # consistent, the evaluated images are also consistent.
-        tf.logging.info('Starting to evaluate.')
+        logging.info('Starting to evaluate.')
         eval_results = est.evaluate(
             input_fn=imagenet_eval.input_fn,
             steps=FLAGS.num_eval_images // FLAGS.eval_batch_size)
-        tf.logging.info('Eval results at step %d: %s',
-                        next_checkpoint, eval_results)
+        logging.info('Eval results at step %d: %s',
+                     next_checkpoint, eval_results)
         ckpt = tf.train.latest_checkpoint(FLAGS.model_dir)
         utils.archive_ckpt(eval_results, eval_results['top_1_accuracy'], ckpt)
 
       elapsed_time = int(time.time() - start_timestamp)
-      tf.logging.info('Finished training up to step %d. Elapsed seconds %d.',
-                      FLAGS.train_steps, elapsed_time)
-      if FLAGS.export_dir:
-        export(est, FLAGS.export_dir, input_image_size)
+      logging.info('Finished training up to step %d. Elapsed seconds %d.',
+                   FLAGS.train_steps, elapsed_time)
+  if FLAGS.export_dir:
+    export(est, FLAGS.export_dir, input_image_size)
 
 
 if __name__ == '__main__':
-  tf.logging.set_verbosity(tf.logging.INFO)
+  logging.set_verbosity(logging.INFO)
   app.run(main)

@@ -19,7 +19,7 @@ from __future__ import division
 from __future__ import print_function
 
 import re
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 import mnasnet_model
 
@@ -311,6 +311,7 @@ def build_mnasnet_model(images, model_name, training, override_params=None):
     model = mnasnet_model.MnasNetModel(blocks_args, global_params)
     logits = model(images, training=training)
 
+  logits = tf.squeeze(tf.expand_dims(logits, 0), 0)
   logits = tf.identity(logits, 'logits')
   return logits, model.endpoints
 

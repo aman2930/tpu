@@ -19,10 +19,11 @@ from __future__ import division
 from __future__ import print_function
 
 import abc
-from collections import namedtuple
+import collections
 import functools
 import os
-import tensorflow as tf
+from absl import logging
+import tensorflow.compat.v1 as tf
 from official.resnet import resnet_preprocessing
 
 
@@ -48,11 +49,23 @@ def image_serving_input_fn():
 class ImageNetTFExampleInput(object):
   """Base class for ImageNet input_fn generator.
 
-  Args:
+  Attributes:
+    image_preprocessing_fn: function to preprocess images
     is_training: `bool` for whether the input is for training
     use_bfloat16: If True, use bfloat16 precision; else use float32.
     transpose_input: 'bool' for whether to use the double transpose trick
+    image_size: size of images
     num_parallel_calls: `int` for the number of parallel threads.
+    include_background_label: `bool` for whether to include the background label
+    augment_name: `string` that is the name of the augmentation method
+        to apply to the image. `autoaugment` if AutoAugment is to be used or
+        `randaugment` if RandAugment is to be used. If the value is `None` no
+        no augmentation method will be applied applied. See autoaugment.py
+        for more details.
+    randaug_num_layers: 'int', if RandAug is used, what should the number of
+      layers be. See autoaugment.py for detailed description.
+    randaug_magnitude: 'int', if RandAug is used, what should the magnitude
+      be. See autoaugment.py for detailed description.
   """
   __metaclass__ = abc.ABCMeta
 
@@ -61,13 +74,21 @@ class ImageNetTFExampleInput(object):
                use_bfloat16,
                image_size=224,
                transpose_input=False,
-               num_parallel_calls=8):
+               num_parallel_calls=8,
+               include_background_label=False,
+               augment_name=None,
+               randaug_num_layers=None,
+               randaug_magnitude=None):
     self.image_preprocessing_fn = resnet_preprocessing.preprocess_image
     self.is_training = is_training
     self.use_bfloat16 = use_bfloat16
     self.transpose_input = transpose_input
     self.image_size = image_size
     self.num_parallel_calls = num_parallel_calls
+    self.include_background_label = include_background_label
+    self.augment_name = augment_name
+    self.randaug_num_layers = randaug_num_layers
+    self.randaug_magnitude = randaug_magnitude
 
   def set_shapes(self, batch_size, images, labels):
     """Statically set the batch_size dimension."""
@@ -106,10 +127,19 @@ class ImageNetTFExampleInput(object):
         image_bytes=image_bytes,
         is_training=self.is_training,
         image_size=self.image_size,
-        use_bfloat16=self.use_bfloat16)
+        use_bfloat16=self.use_bfloat16,
+        augment_name=self.augment_name,
+        randaug_num_layers=self.randaug_num_layers,
+        randaug_magnitude=self.randaug_magnitude)
 
     label = tf.cast(
         tf.reshape(parsed['image/class/label'], shape=[]), dtype=tf.int32)
+
+    if not self.include_background_label:
+      # 'image/class/label' is encoded as an integer from 1 to num_label_classes
+      # In order to generate the correct one-hot label vector from this number,
+      # we subtract the number by 1 to make it in [0, num_label_classes).
+      label -= 1
 
     return image, label
 
@@ -145,7 +175,7 @@ class ImageNetTFExampleInput(object):
 
     # Retrieves the batch size for the current shard. The # of shards is
     # computed according to the input pipeline deployment. See
-    # tf.contrib.tpu.RunConfig for details.
+    # tf.estimator.tpu.RunConfig for details.
     batch_size = params['batch_size']
 
     # TODO(dehao): Replace the following with params['context'].current_host
@@ -169,7 +199,7 @@ class ImageNetTFExampleInput(object):
     # batch size. As long as this validation is done with consistent batch size,
     # exactly the same images will be used.
     dataset = dataset.apply(
-        tf.contrib.data.map_and_batch(
+        tf.data.experimental.map_and_batch(
             self.dataset_parser,
             batch_size=batch_size,
             num_parallel_batches=self.num_parallel_calls,
@@ -185,7 +215,7 @@ class ImageNetTFExampleInput(object):
     dataset = dataset.map(functools.partial(self.set_shapes, batch_size))
 
     # Prefetch overlaps in-feed with training
-    dataset = dataset.prefetch(tf.contrib.data.AUTOTUNE)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
     return dataset
 
 
@@ -215,7 +245,11 @@ class ImageNetInput(ImageNetTFExampleInput):
                num_parallel_calls=8,
                cache=False,
                dataset_split=None,
-               shuffle_shards=False):
+               shuffle_shards=False,
+               include_background_label=False,
+               augment_name=None,
+               randaug_num_layers=None,
+               randaug_magnitude=None):
     """Create an input from TFRecord files.
 
     Args:
@@ -233,12 +267,28 @@ class ImageNetInput(ImageNetTFExampleInput):
         is_training. In this case, is_training specifies whether the data is
         augmented.
       shuffle_shards: Whether to shuffle the dataset shards.
+      include_background_label: Whether to include the background label. If
+        this is True, then num_label_classes should be 1001. If False, then
+        num_label_classes should be 1000.
+      augment_name: `string` that is the name of the augmentation method
+        to apply to the image. `autoaugment` if AutoAugment is to be used or
+        `randaugment` if RandAugment is to be used. If the value is `None` no
+        no augmentation method will be applied applied. See autoaugment.py
+        for more details.
+      randaug_num_layers: 'int', if RandAug is used, what should the number of
+        layers be. See autoaugment.py for detailed description.
+      randaug_magnitude: 'int', if RandAug is used, what should the magnitude
+        be. See autoaugment.py for detailed description.
     """
     super(ImageNetInput, self).__init__(
         is_training=is_training,
         image_size=image_size,
         use_bfloat16=use_bfloat16,
-        transpose_input=transpose_input)
+        transpose_input=transpose_input,
+        include_background_label=include_background_label,
+        augment_name=augment_name,
+        randaug_num_layers=randaug_num_layers,
+        randaug_magnitude=randaug_magnitude)
     self.data_dir = data_dir
     # TODO(b/112427086):  simplify the choice of input source
     if self.data_dir == 'null' or not self.data_dir:
@@ -302,19 +352,19 @@ class ImageNetInput(ImageNetTFExampleInput):
 
     # Read the data from disk in parallel
     dataset = dataset.apply(
-        tf.contrib.data.parallel_interleave(
+        tf.data.experimental.parallel_interleave(
             fetch_dataset, cycle_length=64, sloppy=True))
 
     if self.cache:
       dataset = dataset.cache().apply(
-          tf.contrib.data.shuffle_and_repeat(1024 * 16))
+          tf.data.experimental.shuffle_and_repeat(1024 * 16))
     else:
       dataset = dataset.shuffle(1024)
     return dataset
 
 
 # Defines a selection of data from a Cloud Bigtable.
-BigtableSelection = namedtuple('BigtableSelection', [
+BigtableSelection = collections.namedtuple('BigtableSelection', [
     'project',
     'instance',
     'table',
@@ -327,7 +377,8 @@ BigtableSelection = namedtuple('BigtableSelection', [
 class ImageNetBigtableInput(ImageNetTFExampleInput):
   """Generates ImageNet input_fn from a Bigtable for training or evaluation."""
 
-  def __init__(self, is_training, use_bfloat16, transpose_input, selection):
+  def __init__(self, is_training, use_bfloat16, transpose_input, selection,
+               augment_name, randaug_num_layers, randaug_magnitude):
     """Constructs an ImageNet input from a BigtableSelection.
 
     Args:
@@ -335,17 +386,35 @@ class ImageNetBigtableInput(ImageNetTFExampleInput):
       use_bfloat16: If True, use bfloat16 precision; else use float32.
       transpose_input: 'bool' for whether to use the double transpose trick
       selection: a BigtableSelection specifying a part of a Bigtable.
+      augment_name: `string` that is the name of the augmentation method
+        to apply to the image. `autoaugment` if AutoAugment is to be used or
+        `randaugment` if RandAugment is to be used. If the value is `None` no
+        no augmentation method will be applied applied. See autoaugment.py
+        for more details.
+      randaug_num_layers: 'int', if RandAug is used, what should the number of
+        layers be. See autoaugment.py for detailed description.
+      randaug_magnitude: 'int', if RandAug is used, what should the magnitude
+        be. See autoaugment.py for detailed description.
     """
     super(ImageNetBigtableInput, self).__init__(
         is_training=is_training,
         use_bfloat16=use_bfloat16,
-        transpose_input=transpose_input)
+        transpose_input=transpose_input,
+        augment_name=augment_name,
+        randaug_num_layers=randaug_num_layers,
+        randaug_magnitude=randaug_magnitude)
     self.selection = selection
 
   def make_source_dataset(self, index, num_hosts):
     """See base class."""
+    try:
+      from tensorflow.contrib.cloud import BigtableClient  # pylint: disable=g-import-not-at-top
+    except ImportError as e:
+      logging.exception('Bigtable is not supported in TensorFlow 2.x.')
+      raise e
+
     data = self.selection
-    client = tf.contrib.cloud.BigtableClient(data.project, data.instance)
+    client = BigtableClient(data.project, data.instance)
     table = client.table(data.table)
     ds = table.parallel_scan_prefix(
         data.prefix, columns=[(data.column_family, data.column_qualifier)])

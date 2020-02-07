@@ -20,7 +20,7 @@ from __future__ import print_function
 
 import os
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 import resnet_preprocessing
 
@@ -121,11 +121,13 @@ class ImageNetInput(object):
     Returns:
       A `tf.data.Dataset` object.
     """
-    del ctx
     # Shuffle the filenames to ensure better randomization.
     file_pattern = os.path.join(
         self.data_dir, 'train-*' if self.is_training else 'validation-*')
     dataset = tf.data.Dataset.list_files(file_pattern, shuffle=self.is_training)
+
+    if ctx and ctx.num_input_pipelines > 1:
+      dataset = dataset.shard(ctx.num_input_pipelines, ctx.input_pipeline_id)
 
     if self.is_training:
       dataset = dataset.repeat()
@@ -155,11 +157,7 @@ class ImageNetInput(object):
     dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
     if self.is_training:
-      # Use a private thread pool and limit intra-op parallelism. Enable
-      # non-determinism only for training.
       options = tf.data.Options()
-      options.experimental_threading.max_intra_op_parallelism = 1
-      options.experimental_threading.private_threadpool_size = 16
       options.experimental_deterministic = False
       dataset = dataset.with_options(options)
 

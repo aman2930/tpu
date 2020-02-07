@@ -15,7 +15,7 @@
 """Input and model functions for serving/inference."""
 
 import six
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 import box_utils
 import heads
@@ -50,7 +50,7 @@ def convert_image(image):
 def preprocess_image(image, desired_image_size, padding_stride):
   """Preprocess a decode image tensor."""
   image = preprocess_ops.normalize_image(image)
-  image, image_info, _, _ = preprocess_ops.resize_and_pad(
+  image, image_info, _, _, _ = preprocess_ops.resize_crop_pad(
       image, desired_image_size, padding_stride)
   return image, image_info
 
@@ -170,8 +170,6 @@ def serving_input_fn(batch_size,
                      input_name='input'):
   """Input function for SavedModels and TF serving.
 
-  Returns a `tf.estimator.export.ServingInputReceiver` for a SavedModel.
-
   Args:
     batch_size: The batch size.
     desired_image_size: The tuple/list of two integers, specifying the desired
@@ -181,6 +179,10 @@ def serving_input_fn(batch_size,
     input_type: a string of 'image_tensor', 'image_bytes' or 'tf_example',
       specifying which type of input will be used in serving.
     input_name: a string to specify the name of the input signature.
+
+  Returns:
+    a `tf.estimator.export.ServingInputReceiver` for a SavedModel.
+
   """
   if input_type == 'image_tensor':
     placeholder, features = image_tensor_input(
@@ -257,11 +259,12 @@ def serving_model_graph_builder(output_source_id,
     if output_box_features:
       final_box_rois = model_outputs['detection_boxes']
       final_roi_features = spatial_transform_ops.multilevel_crop_and_resize(
-          model_outputs['fpn_feats'], final_box_rois, output_size=7)
-      _, _, final_box_features = heads.box_head(
+          model_outputs['fpn_features'], final_box_rois, output_size=7)
+      class_outputs, _, final_box_features = heads.box_head(
           final_roi_features, num_classes=params['num_classes'],
           mlp_head_dim=params['fast_rcnn_mlp_head_dim'])
       model_outputs.update({
+          'detection_logits': class_outputs,
           'detection_features': final_box_features,
       })
 
@@ -275,8 +278,8 @@ def serving_model_graph_builder(output_source_id,
 
   def _serving_model_graph_wrapper(features, params):
     """Builds the model graph with outputs casted to bfloat16 if nessarary."""
-    if params['use_bfloat16']:
-      with tf.contrib.tpu.bfloat16_scope():
+    if params['precision'] == 'bfloat16':
+      with tf.tpu.bfloat16_scope():
         model_outputs = _serving_model_graph(features, params)
         def _cast_outputs_to_float(d):
           for k, v in sorted(six.iteritems(d)):
@@ -349,11 +352,14 @@ def serving_model_fn_builder(output_source_id,
       predictions['image_info'] = tf.identity(
           model_outputs['image_info'], 'ImageInfo')
     if output_box_features:
+      predictions['detection_logits'] = tf.identity(
+          model_outputs['detection_logits'], 'DetectionLogits')
       predictions['detection_features'] = tf.identity(
           model_outputs['detection_features'], 'DetectionFeatures')
 
     if params['use_tpu']:
-      return tf.contrib.tpu.TPUEstimatorSpec(mode=mode, predictions=predictions)
+      return tf.estimator.tpu.TPUEstimatorSpec(mode=mode,
+                                               predictions=predictions)
     return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
 
   return _serving_model_fn

@@ -28,6 +28,7 @@ import tensorflow as tf
 import anchors
 from object_detection import preprocessor
 from object_detection import tf_example_decoder
+from tensorflow.contrib import data as contrib_data
 
 MAX_NUM_INSTANCES = 100
 # Represents the number of bytes in the read buffer.
@@ -369,7 +370,7 @@ class InputReader(object):
       return dataset
 
     dataset = dataset.apply(
-        tf.contrib.data.parallel_interleave(
+        contrib_data.parallel_interleave(
             _prefetch_dataset, cycle_length=32, sloppy=self._is_training))
 
     if params.get('dataset_private_threadpool_size', None):
@@ -389,7 +390,7 @@ class InputReader(object):
 
     # Parse the fetched records to input tensors for model function.
     dataset = dataset.map(_dataset_parser, num_parallel_calls=64)
-    dataset = dataset.prefetch(tf.contrib.data.AUTOTUNE)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
     dataset = dataset.batch(batch_size, drop_remainder=True)
 
     def _process_example(images, cls_targets, box_targets, num_positives,
@@ -418,7 +419,7 @@ class InputReader(object):
       return images, labels
 
     dataset = dataset.map(_process_example)
-    dataset = dataset.prefetch(tf.contrib.data.AUTOTUNE)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
     if self._num_examples > 0:
       dataset = dataset.take(self._num_examples)
     return dataset
@@ -483,7 +484,7 @@ class SegmentationInputReader(object):
       return dataset
 
     dataset = dataset.apply(
-        tf.contrib.data.parallel_interleave(
+        contrib_data.parallel_interleave(
             _prefetch_dataset, cycle_length=32, sloppy=self._is_training))
     if self._is_training:
       dataset = dataset.shuffle(64)
@@ -491,5 +492,5 @@ class SegmentationInputReader(object):
     dataset = dataset.map(_dataset_parser, num_parallel_calls=64)
     dataset = dataset.prefetch(batch_size)
     dataset = dataset.batch(batch_size, drop_remainder=True)
-    dataset = dataset.prefetch(tf.contrib.data.AUTOTUNE)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
     return dataset

@@ -21,7 +21,7 @@ from __future__ import print_function
 # Standard Imports
 
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 BBOX_XFORM_CLIP = np.log(1000. / 16.)
@@ -66,9 +66,7 @@ def bbox_overlap(boxes, gt_boxes):
     iou = i_area / u_area
 
     # Fills -1 for padded ground truth boxes.
-    padding_mask = tf.logical_and(
-        tf.less(i_xmax, tf.zeros_like(i_xmax)),
-        tf.less(i_ymax, tf.zeros_like(i_ymax)))
+    padding_mask = tf.less(i_xmin, tf.zeros_like(i_xmin))
     iou = tf.where(padding_mask, -tf.ones_like(iou), iou)
 
     return iou

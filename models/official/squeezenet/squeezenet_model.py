@@ -25,16 +25,17 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
-
+from tensorflow.contrib import layers as contrib_layers
+from tensorflow.contrib import tpu as contrib_tpu
 
 
 def conv2d(inputs,
            filters,
            kernel_size,
            strides=(1, 1),
-           kernel_initializer=tf.contrib.layers.xavier_initializer_conv2d(),
+           kernel_initializer=contrib_layers.xavier_initializer_conv2d(),
            bias_initializer=tf.zeros_initializer(),
-           kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=0.0002),
+           kernel_regularizer=contrib_layers.l2_regularizer(scale=0.0002),
            name=None):
   return tf.layers.conv2d(
       inputs,
@@ -99,41 +100,44 @@ def model_fn(features, labels, mode, params):
   loss = tf.reduce_mean(
       tf.losses.sparse_softmax_cross_entropy(logits=logits, labels=labels))
 
-  global_batch_size = params["num_shards"] * params["batch_size"]
-  decay_steps = 1300 * 1000 * params["num_epochs"] // global_batch_size
+  global_batch_size = (params["train"]["num_cores_per_replica"] *
+                       params["train"]["train_batch_size"])
+  decay_steps = (params["train"]["num_examples_per_epoch"] *
+                 params["train"]["num_epochs"]) // global_batch_size
   learning_rate = tf.train.polynomial_decay(
-      params["lr"],
+      params["train"]["learning_rate"]["init_learning_rate"],
       global_step=tf.train.get_or_create_global_step(),
-      end_learning_rate=params["min_lr"],
+      end_learning_rate=params["train"]["learning_rate"]["end_learning_rate"],
       decay_steps=decay_steps,
       power=1.0,
       cycle=False)
 
   # TODO(power): Hack copied from resnet: remove when summaries are working.
   lr_repeat = tf.reshape(
-      tf.tile(tf.expand_dims(learning_rate, 0), [params["batch_size"],]),
-      [params["batch_size"], 1])
+      tf.tile(tf.expand_dims(learning_rate, 0),
+              [params["train"]["train_batch_size"],]),
+      [params["train"]["train_batch_size"], 1])
 
-  if params["optimizer"] == "adam":
+  if params["train"]["optimizer"]["type"] == "adam":
     optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
-  elif params["optimizer"] == "rmsprop":
+  elif params["train"]["optimizer"]["type"] == "rmsprop":
     optimizer = tf.train.RMSPropOptimizer(
         learning_rate=learning_rate,
-        momentum=params["momentum"],
+        momentum=params["train"]["optimizer"]["momentum"],
         epsilon=1.0
     )
   else:
     optimizer = tf.train.MomentumOptimizer(
         learning_rate=learning_rate,
-        momentum=params["momentum"],
+        momentum=params["train"]["optimizer"]["momentum"],
         use_nesterov=True)
 
   if params["use_tpu"]:
-    optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
+    optimizer = contrib_tpu.CrossShardOptimizer(optimizer)
 
   train_op = optimizer.minimize(loss, tf.train.get_global_step())
 
-  return tf.contrib.tpu.TPUEstimatorSpec(
+  return contrib_tpu.TPUEstimatorSpec(
       mode=mode,
       loss=loss,
       train_op=train_op,

@@ -24,10 +24,10 @@ from __future__ import print_function
 
 import os
 from absl import flags
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
-import vgg_preprocessing
 import inception_preprocessing
+import vgg_preprocessing
 
 FLAGS = flags.FLAGS
 
@@ -194,8 +194,8 @@ class InputPipeline(object):
     """Parse an Imagenet record from value."""
     if FLAGS.preprocessed:
       keys_to_features = {
-          'image': tf.FixedLenFeature([], tf.string),
-          'label': tf.FixedLenFeature([], tf.int64),
+          'image': tf.io.FixedLenFeature([], tf.string),
+          'label': tf.io.FixedLenFeature([], tf.int64),
       }
       features = tf.parse_single_example(serialized_proto, keys_to_features)
       image = tf.decode_raw(features['image'], tf.float32)
@@ -204,23 +204,23 @@ class InputPipeline(object):
     else:
       keys_to_features = {
           'image/encoded':
-              tf.FixedLenFeature((), tf.string, default_value=''),
+              tf.io.FixedLenFeature((), tf.string, default_value=''),
           'image/format':
-              tf.FixedLenFeature((), tf.string, default_value='jpeg'),
+              tf.io.FixedLenFeature((), tf.string, default_value='jpeg'),
           'image/class/label':
-              tf.FixedLenFeature([], dtype=tf.int64, default_value=-1),
+              tf.io.FixedLenFeature([], dtype=tf.int64, default_value=-1),
           'image/class/text':
-              tf.FixedLenFeature([], dtype=tf.string, default_value=''),
+              tf.io.FixedLenFeature([], dtype=tf.string, default_value=''),
           'image/object/bbox/xmin':
-              tf.VarLenFeature(dtype=tf.float32),
+              tf.io.VarLenFeature(dtype=tf.float32),
           'image/object/bbox/ymin':
-              tf.VarLenFeature(dtype=tf.float32),
+              tf.io.VarLenFeature(dtype=tf.float32),
           'image/object/bbox/xmax':
-              tf.VarLenFeature(dtype=tf.float32),
+              tf.io.VarLenFeature(dtype=tf.float32),
           'image/object/bbox/ymax':
-              tf.VarLenFeature(dtype=tf.float32),
+              tf.io.VarLenFeature(dtype=tf.float32),
           'image/object/class/label':
-              tf.VarLenFeature(dtype=tf.int64),
+              tf.io.VarLenFeature(dtype=tf.int64),
       }
       features = tf.parse_single_example(serialized_proto, keys_to_features)
       image = tf.image.decode_jpeg(features['image/encoded'],
@@ -297,8 +297,11 @@ class InputPipeline(object):
             dataset = dataset.prefetch(FLAGS.prefetch_size)
         return dataset
 
-      dataset = dataset.apply(tf.contrib.data.parallel_interleave(
-          prefetch_dataset, cycle_length=FLAGS.num_files_infeed, sloppy=True))
+      dataset = dataset.apply(
+          tf.data.experimental.parallel_interleave(
+              prefetch_dataset,
+              cycle_length=FLAGS.num_files_infeed,
+              sloppy=True))
 
       if FLAGS.followup_shuffle_buffer_size > 0:
         dataset = dataset.shuffle(
@@ -310,10 +313,9 @@ class InputPipeline(object):
 
       dataset = dataset.prefetch(batch_size)
 
-      dataset = dataset.apply(
-          tf.contrib.data.batch_and_drop_remainder(batch_size))
+      dataset = dataset.batch(batch_size, drop_remainder=True)
 
-      dataset = dataset.prefetch(tf.contrib.data.AUTOTUNE)
+      dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
       images, labels = dataset.make_one_shot_iterator().get_next()
       images = tf.reshape(images, [batch_size, FLAGS.height, FLAGS.width,
@@ -335,4 +337,3 @@ class InputPipeline(object):
       images = tensor_transform_fn(images, params['output_perm'])
 
     return images, labels
-

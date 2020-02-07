@@ -22,12 +22,14 @@ import abc
 import collections
 import functools
 import os
-import tensorflow as tf
+
+from absl import logging
+import tensorflow.compat.v1 as tf
 
 import preprocessing
 
 
-def build_image_serving_input_fn(image_size):
+def build_image_serving_input_fn(image_size, batch_size=None):
   """Builds a serving input fn for raw images."""
   def _image_serving_input_fn():
     """Serving input fn for raw images."""
@@ -38,7 +40,7 @@ def build_image_serving_input_fn(image_size):
       return image
 
     image_bytes_list = tf.placeholder(
-        shape=[None],
+        shape=[batch_size],
         dtype=tf.string,
     )
     images = tf.map_fn(
@@ -57,6 +59,19 @@ class ImageNetTFExampleInput(object):
     num_cores: `int` for the number of TPU cores
     image_size: `int` for image size (both width and height).
     transpose_input: 'bool' for whether to use the double transpose trick
+    num_label_classes: number of label classes. Default to 1000 for ImageNet.
+    include_background_label: If true, label #0 is reserved for background.
+    augment_name: `string` that is the name of the augmentation method
+        to apply to the image. `autoaugment` if AutoAugment is to be used or
+        `randaugment` if RandAugment is to be used. If the value is `None` no
+        no augmentation method will be applied applied. See autoaugment.py
+        for more details.
+    mixup_alpha: float to control the strength of Mixup regularization, set
+        to 0.0 to disable.
+    randaug_num_layers: 'int', if RandAug is used, what should the number of
+      layers be. See autoaugment.py for detailed description.
+    randaug_magnitude: 'int', if RandAug is used, what should the magnitude
+      be. See autoaugment.py for detailed description.
   """
   __metaclass__ = abc.ABCMeta
 
@@ -65,13 +80,27 @@ class ImageNetTFExampleInput(object):
                use_bfloat16,
                num_cores=8,
                image_size=224,
-               transpose_input=False):
+               transpose_input=False,
+               num_label_classes=1000,
+               include_background_label=False,
+               augment_name=None,
+               mixup_alpha=0.0,
+               randaug_num_layers=None,
+               randaug_magnitude=None):
     self.image_preprocessing_fn = preprocessing.preprocess_image
     self.is_training = is_training
     self.use_bfloat16 = use_bfloat16
     self.num_cores = num_cores
     self.transpose_input = transpose_input
     self.image_size = image_size
+    self.include_background_label = include_background_label
+    self.num_label_classes = num_label_classes
+    if include_background_label:
+      self.num_label_classes += 1
+    self.augment_name = augment_name
+    self.mixup_alpha = mixup_alpha
+    self.randaug_num_layers = randaug_num_layers
+    self.randaug_magnitude = randaug_magnitude
 
   def set_shapes(self, batch_size, images, labels):
     """Statically set the batch_size dimension."""
@@ -79,14 +108,41 @@ class ImageNetTFExampleInput(object):
       images.set_shape(images.get_shape().merge_with(
           tf.TensorShape([None, None, None, batch_size])))
       labels.set_shape(labels.get_shape().merge_with(
-          tf.TensorShape([batch_size])))
+          tf.TensorShape([batch_size, None])))
     else:
       images.set_shape(images.get_shape().merge_with(
           tf.TensorShape([batch_size, None, None, None])))
       labels.set_shape(labels.get_shape().merge_with(
-          tf.TensorShape([batch_size])))
+          tf.TensorShape([batch_size, None])))
 
     return images, labels
+
+  def mixup(self, batch_size, alpha, images, labels):
+    """Applies Mixup regularization to a batch of images and labels.
+
+    [1] Hongyi Zhang, Moustapha Cisse, Yann N. Dauphin, David Lopez-Paz
+      Mixup: Beyond Empirical Risk Minimization.
+      ICLR'18, https://arxiv.org/abs/1710.09412
+
+    Arguments:
+      batch_size: The input batch size for images and labels.
+      alpha: Float that controls the strength of Mixup regularization.
+      images: A batch of images of shape [batch_size, ...]
+      labels: A batch of labels of shape [batch_size, num_classes]
+
+    Returns:
+      A tuple of (images, labels) with the same dimensions as the input with
+      Mixup regularization applied.
+    """
+    mix_weight = tf.distributions.Beta(alpha, alpha).sample([batch_size, 1])
+    mix_weight = tf.maximum(mix_weight, 1. - mix_weight)
+    images_mix_weight = tf.reshape(mix_weight, [batch_size, 1, 1, 1])
+    # Mixup on a single batch is implemented by taking a weighted sum with the
+    # same batch in reverse.
+    images_mix = (
+        images * images_mix_weight + images[::-1] * (1. - images_mix_weight))
+    labels_mix = labels * mix_weight + labels[::-1] * (1. - mix_weight)
+    return images_mix, labels_mix
 
   def dataset_parser(self, value):
     """Parses an image and its label from a serialized ResNet-50 TFExample.
@@ -109,13 +165,22 @@ class ImageNetTFExampleInput(object):
         image_bytes=image_bytes,
         is_training=self.is_training,
         image_size=self.image_size,
-        use_bfloat16=self.use_bfloat16)
+        use_bfloat16=self.use_bfloat16,
+        augment_name=self.augment_name,
+        randaug_num_layers=self.randaug_num_layers,
+        randaug_magnitude=self.randaug_magnitude)
 
-    # Subtract one so that labels are in [0, 1000).
+    # The labels will be in range [1,1000], 0 is reserved for background
     label = tf.cast(
-        tf.reshape(parsed['image/class/label'], shape=[]), dtype=tf.int32) - 1
+        tf.reshape(parsed['image/class/label'], shape=[]), dtype=tf.int32)
 
-    return image, label
+    if not self.include_background_label:
+      # Subtract 1 if the background label is discarded.
+      label -= 1
+
+    onehot_label = tf.one_hot(label, self.num_label_classes)
+
+    return image, onehot_label
 
   @abc.abstractmethod
   def make_source_dataset(self, index, num_hosts):
@@ -148,7 +213,7 @@ class ImageNetTFExampleInput(object):
     """
     # Retrieves the batch size for the current shard. The # of shards is
     # computed according to the input pipeline deployment. See
-    # tf.contrib.tpu.RunConfig for details.
+    # tf.estimator.tpu.RunConfig for details.
     batch_size = params['batch_size']
 
     if 'context' in params:
@@ -171,9 +236,15 @@ class ImageNetTFExampleInput(object):
     # batch size. As long as this validation is done with consistent batch size,
     # exactly the same images will be used.
     dataset = dataset.apply(
-        tf.contrib.data.map_and_batch(
+        tf.data.experimental.map_and_batch(
             self.dataset_parser, batch_size=batch_size,
             num_parallel_batches=self.num_cores, drop_remainder=True))
+
+    # Apply Mixup
+    if self.is_training and self.mixup_alpha > 0.0:
+      dataset = dataset.map(
+          functools.partial(self.mixup, batch_size, self.mixup_alpha),
+          num_parallel_calls=self.num_cores)
 
     # Transpose for performance on TPU
     if self.transpose_input:
@@ -185,7 +256,7 @@ class ImageNetTFExampleInput(object):
     dataset = dataset.map(functools.partial(self.set_shapes, batch_size))
 
     # Prefetch overlaps in-feed with training
-    dataset = dataset.prefetch(tf.contrib.data.AUTOTUNE)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
     return dataset
 
 
@@ -213,7 +284,13 @@ class ImageNetInput(ImageNetTFExampleInput):
                data_dir,
                image_size=224,
                num_parallel_calls=64,
-               cache=False):
+               cache=False,
+               num_label_classes=1000,
+               include_background_label=False,
+               augment_name=None,
+               mixup_alpha=0.0,
+               randaug_num_layers=None,
+               randaug_magnitude=None):
     """Create an input from TFRecord files.
 
     Args:
@@ -226,13 +303,32 @@ class ImageNetInput(ImageNetTFExampleInput):
           and blank labels.
       image_size: `int` for image size (both width and height).
       num_parallel_calls: concurrency level to use when reading data from disk.
-      cache: if true, fill the dataset by repeating from its cache
+      cache: if true, fill the dataset by repeating from its cache.
+      num_label_classes: number of label classes. Default to 1000 for ImageNet.
+      include_background_label: if true, label #0 is reserved for background.
+      augment_name: `string` that is the name of the augmentation method
+          to apply to the image. `autoaugment` if AutoAugment is to be used or
+          `randaugment` if RandAugment is to be used. If the value is `None` no
+          no augmentation method will be applied applied. See autoaugment.py
+          for more details.
+      mixup_alpha: float to control the strength of Mixup regularization, set
+          to 0.0 to disable.
+      randaug_num_layers: 'int', if RandAug is used, what should the number of
+        layers be. See autoaugment.py for detailed description.
+      randaug_magnitude: 'int', if RandAug is used, what should the magnitude
+        be. See autoaugment.py for detailed description.
     """
     super(ImageNetInput, self).__init__(
         is_training=is_training,
         image_size=image_size,
         use_bfloat16=use_bfloat16,
-        transpose_input=transpose_input)
+        transpose_input=transpose_input,
+        num_label_classes=num_label_classes,
+        include_background_label=include_background_label,
+        augment_name=augment_name,
+        mixup_alpha=mixup_alpha,
+        randaug_num_layers=randaug_num_layers,
+        randaug_magnitude=randaug_magnitude)
     self.data_dir = data_dir
     if self.data_dir == 'null' or not self.data_dir:
       self.data_dir = None
@@ -256,13 +352,13 @@ class ImageNetInput(ImageNetTFExampleInput):
   def dataset_parser(self, value):
     """See base class."""
     if not self.data_dir:
-      return value, tf.constant(0, tf.int32)
+      return value, tf.constant(0., tf.float32, (1000,))
     return super(ImageNetInput, self).dataset_parser(value)
 
   def make_source_dataset(self, index, num_hosts):
     """See base class."""
     if not self.data_dir:
-      tf.logging.info('Undefined data_dir implies null input')
+      logging.info('Undefined data_dir implies null input')
       return tf.data.Dataset.range(1).repeat().map(self._get_null_input)
 
     # Shuffle the filenames to ensure better randomization.
@@ -285,12 +381,12 @@ class ImageNetInput(ImageNetTFExampleInput):
 
     # Read the data from disk in parallel
     dataset = dataset.apply(
-        tf.contrib.data.parallel_interleave(
+        tf.data.experimental.parallel_interleave(
             fetch_dataset, cycle_length=self.num_parallel_calls, sloppy=True))
 
     if self.cache:
       dataset = dataset.cache().apply(
-          tf.contrib.data.shuffle_and_repeat(1024 * 16))
+          tf.data.experimental.shuffle_and_repeat(1024 * 16))
     else:
       dataset = dataset.shuffle(1024)
     return dataset
@@ -307,7 +403,17 @@ class ImageNetBigtableInput(ImageNetTFExampleInput):
   """Generates ImageNet input_fn from a Bigtable for training or evaluation.
   """
 
-  def __init__(self, is_training, use_bfloat16, transpose_input, selection):
+  def __init__(self,
+               is_training,
+               use_bfloat16,
+               transpose_input,
+               selection,
+               augment_name=None,
+               num_label_classes=1000,
+               include_background_label=False,
+               mixup_alpha=0.0,
+               randaug_num_layers=None,
+               randaug_magnitude=None):
     """Constructs an ImageNet input from a BigtableSelection.
 
     Args:
@@ -315,17 +421,42 @@ class ImageNetBigtableInput(ImageNetTFExampleInput):
       use_bfloat16: If True, use bfloat16 precision; else use float32.
       transpose_input: 'bool' for whether to use the double transpose trick
       selection: a BigtableSelection specifying a part of a Bigtable.
+      augment_name: `string` that is the name of the augmentation method
+          to apply to the image. `autoaugment` if AutoAugment is to be used or
+          `randaugment` if RandAugment is to be used. If the value is `None` no
+          no augmentation method will be applied applied. See autoaugment.py
+          for more details.
+      num_label_classes: number of label classes. Default to 1000 for ImageNet.
+      include_background_label: if true, label #0 is reserved for background.
+      mixup_alpha: float to control the strength of Mixup regularization, set
+          to 0.0 to disable.
+      randaug_num_layers: 'int', if RandAug is used, what should the number of
+        layers be. See autoaugment.py for detailed description.
+      randaug_magnitude: 'int', if RandAug is used, what should the magnitude
+        be. See autoaugment.py for detailed description.s
     """
     super(ImageNetBigtableInput, self).__init__(
         is_training=is_training,
         use_bfloat16=use_bfloat16,
-        transpose_input=transpose_input)
+        transpose_input=transpose_input,
+        num_label_classes=num_label_classes,
+        include_background_label=include_background_label,
+        augment_name=augment_name,
+        mixup_alpha=mixup_alpha,
+        randaug_num_layers=randaug_num_layers,
+        randaug_magnitude=randaug_magnitude)
     self.selection = selection
 
   def make_source_dataset(self, index, num_hosts):
     """See base class."""
+    try:
+      from tensorflow.contrib.cloud import BigtableClient  # pylint: disable=g-import-not-at-top
+    except ImportError as e:
+      logging.exception('Bigtable is not supported in TensorFlow 2.x.')
+      raise e
+
     data = self.selection
-    client = tf.contrib.cloud.BigtableClient(data.project, data.instance)
+    client = BigtableClient(data.project, data.instance)
     table = client.table(data.table)
     ds = table.parallel_scan_prefix(data.prefix,
                                     columns=[(data.column_family,
